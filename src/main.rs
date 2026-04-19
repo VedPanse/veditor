@@ -6,13 +6,14 @@ use std::{
 	process::Command,
 	sync::{
 		mpsc::{self, Receiver, Sender},
-		Arc, Mutex, OnceLock,
+		Arc, Mutex,
 	},
 	thread,
 	time::{Duration, Instant},
 };
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use image::imageops::FilterType;
 use image::{DynamicImage, GenericImageView, ImageReader};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use ratatui::{
@@ -32,9 +33,11 @@ const INITIAL_ROWS: u16 = 40;
 const INITIAL_COLS: u16 = 120;
 const METRICS_SAMPLE_RATE: Duration = Duration::from_millis(350);
 const HISTORY_POINTS: usize = 32;
+const PROJECT_TREE_SEARCH_TIMEOUT: Duration = Duration::from_millis(1200);
+const DOCUMENT_PREVIEW_MAX_LINES: usize = 1200;
 
 fn main() -> io::Result<()> {
-	let mut app = App::new(PathBuf::from(STARTUP_FILE))?;
+	let mut app = App::new(env::args_os().nth(1).map(PathBuf::from))?;
 	ratatui::run(|terminal| run_app(terminal, &mut app))
 }
 
@@ -99,7 +102,8 @@ struct App {
 	pending_codex_request: Option<u64>,
 	project_picker: Option<ProjectPicker>,
 	create_prompt: Option<CreatePrompt>,
-	editor_preview: Option<ImagePreview>,
+	command_prompt: Option<String>,
+	editor_preview: Option<EditorPreview>,
 	open_files: Vec<PathBuf>,
 	active_file: Option<PathBuf>,
 	nvim: PtyPane,
@@ -156,15 +160,47 @@ struct CreatePrompt {
 	input: String,
 }
 
+enum EditorPreview {
+	Image(ImagePreview),
+	Document(DocumentPreview),
+}
+
 struct ImagePreview {
 	path: PathBuf,
 	image: DynamicImage,
+	cache: Option<ImagePreviewCache>,
+}
+
+struct DocumentPreview {
+	path: PathBuf,
+	kind: &'static str,
+	summary: String,
+	lines: Vec<Line<'static>>,
+}
+
+struct ImagePreviewCache {
+	width: u16,
+	height: u16,
+	panel: Color,
+	lines: Vec<Line<'static>>,
+}
+
+impl EditorPreview {
+	fn path(&self) -> &Path {
+		match self {
+			Self::Image(preview) => &preview.path,
+			Self::Document(preview) => &preview.path,
+		}
+	}
 }
 
 struct ProjectPicker {
 	current_dir: PathBuf,
 	entries: Vec<ProjectPickerEntry>,
 	selected: usize,
+	search_query: String,
+	search_match: Option<PathBuf>,
+	last_search_input: Option<Instant>,
 }
 
 struct ProjectPickerEntry {
@@ -200,6 +236,9 @@ struct ProjectTree {
 	expanded: BTreeSet<PathBuf>,
 	visible: Vec<TreeEntry>,
 	selected: usize,
+	search_query: String,
+	search_match: Option<PathBuf>,
+	last_search_input: Option<Instant>,
 }
 
 #[derive(Clone)]
@@ -212,6 +251,20 @@ struct TreeEntry {
 enum TreeAction {
 	OpenFile(PathBuf),
 	ToggleDir,
+}
+
+enum TreeSearchUpdate {
+	Cleared,
+	Matched(PathBuf),
+	NoMatch,
+	Unchanged,
+}
+
+enum ProjectPickerSearchUpdate {
+	Cleared,
+	Matched(PathBuf),
+	NoMatch,
+	Unchanged,
 }
 
 struct CodexResult {
@@ -231,13 +284,33 @@ struct NvimBufferState {
 }
 
 impl App {
-	fn new(file_path: PathBuf) -> io::Result<Self> {
+	fn new(requested_path: Option<PathBuf>) -> io::Result<Self> {
 		let saved_session = load_saved_session();
-		let root = saved_session
-			.as_ref()
-			.map(|session| session.root.clone())
-			.unwrap_or(env::current_dir()?);
-		let ui = ui_theme();
+		let cwd = env::current_dir()?;
+		let (root, saved_session, requested_path) = if let Some(requested_path) = requested_path {
+			let requested_path = absolutize_path(&cwd, &requested_path);
+			let requested_path = if requested_path.exists() {
+				fs::canonicalize(&requested_path).unwrap_or(requested_path)
+			} else {
+				requested_path
+			};
+			let root = if requested_path.is_dir() {
+				requested_path.clone()
+			} else {
+				requested_path
+					.parent()
+					.unwrap_or(&cwd)
+					.to_path_buf()
+			};
+			(root, None, Some(requested_path))
+		} else {
+			let root = saved_session
+				.as_ref()
+				.map(|session| session.root.clone())
+				.unwrap_or(cwd);
+			(root, saved_session, None)
+		};
+		let ui = ui_theme(ACCENT_COLOR);
 		let restored_files = saved_session
 			.as_ref()
 			.map(|session| sanitize_session_files(&root, &session.open_files))
@@ -247,10 +320,11 @@ impl App {
 			.and_then(|session| sanitize_session_active_file(&root, session.active_file.as_ref()));
 		let startup_target = resolve_startup_target(
 			&root,
-			restored_active
+			requested_path
 				.as_deref()
+				.or(restored_active.as_deref())
 				.or_else(|| restored_files.first().map(PathBuf::as_path))
-				.unwrap_or(&file_path),
+				.unwrap_or(Path::new(STARTUP_FILE)),
 		);
 		let initial_editor_target = initial_editor_target(&root, &restored_files, &startup_target);
 		let mut project_tree = ProjectTree::new(root.clone());
@@ -273,10 +347,11 @@ impl App {
 			pending_codex_request: None,
 			project_picker: None,
 			create_prompt: None,
+			command_prompt: None,
 			editor_preview: None,
 			open_files: Vec::new(),
 			active_file: None,
-			nvim: PtyPane::spawn_nvim(initial_editor_target.clone(), ui)?,
+			nvim: PtyPane::spawn_nvim(initial_editor_target.clone(), root.clone(), ui)?,
 			terminal: PtyPane::spawn_shell(root)?,
 		}
 		.with_metrics();
@@ -291,6 +366,10 @@ impl App {
 		}
 		if let Some(status) = self.terminal.poll_exit() {
 			self.status_message = status;
+		}
+		self.project_tree.expire_search();
+		if let Some(picker) = &mut self.project_picker {
+			picker.expire_search();
 		}
 		self.receive_codex_replies();
 		self.refresh_terminal_metrics(false);
@@ -363,17 +442,28 @@ impl App {
 	}
 
 	fn handle_project_tree_key(&mut self, key: KeyEvent) -> AppAction {
-		if self.project_picker.is_some() {
-			return self.handle_project_picker_key(key);
+		if is_project_open_shortcut(key) {
+			self.create_prompt = None;
+			self.command_prompt = None;
+			self.begin_project_switch_prompt();
+			return AppAction::Continue;
 		}
 
 		if self.create_prompt.is_some() {
 			return self.handle_create_prompt_key(key);
 		}
 
-		if is_project_open_shortcut(key) {
-			self.begin_project_switch_prompt();
+		if self.command_prompt.is_some() {
+			return self.handle_command_prompt_key(key);
+		}
+
+		if is_command_prompt_start(key) {
+			self.begin_command_prompt();
 			return AppAction::Continue;
+		}
+
+		if self.project_picker.is_some() {
+			return self.handle_project_picker_key(key);
 		}
 
 		if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -403,20 +493,41 @@ impl App {
 		}
 
 		match key.code {
-			KeyCode::Char('%') => {
+			KeyCode::Char('%') if !self.project_tree.search_active() => {
 				self.begin_create_prompt(CreateKind::File, self.project_tree.root.clone());
 				AppAction::Continue
 			}
-			KeyCode::Esc => AppAction::Quit,
+			KeyCode::Esc => {
+				if self.project_tree.search_active() {
+					self.project_tree.clear_search();
+					self.status_message = "cleared tree search".to_string();
+					AppAction::Continue
+				} else {
+					AppAction::Quit
+				}
+			}
+			KeyCode::Backspace => {
+				let update = self.project_tree.backspace_search();
+				self.apply_project_tree_search_update(update);
+				AppAction::Continue
+			}
 			KeyCode::Up => {
+				self.project_tree.clear_search();
 				self.project_tree.move_selection(-1);
 				AppAction::Continue
 			}
 			KeyCode::Down => {
+				self.project_tree.clear_search();
 				self.project_tree.move_selection(1);
 				AppAction::Continue
 			}
 			KeyCode::Enter => {
+				if self.project_tree.search_active() && !self.project_tree.has_search_match() {
+					self.status_message = format!("no match for {}", self.project_tree.search_query);
+					return AppAction::Continue;
+				}
+
+				self.project_tree.clear_search();
 				match self.project_tree.activate_selected() {
 					Some(TreeAction::ToggleDir) => {
 						self.status_message = "toggled directory".to_string();
@@ -431,6 +542,15 @@ impl App {
 					}
 					None => {}
 				}
+				AppAction::Continue
+			}
+			KeyCode::Char(ch)
+				if !key
+					.modifiers
+					.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) =>
+			{
+				let update = self.project_tree.push_search_text(&ch.to_string());
+				self.apply_project_tree_search_update(update);
 				AppAction::Continue
 			}
 			_ => AppAction::Continue,
@@ -464,26 +584,99 @@ impl App {
 		AppAction::Continue
 	}
 
+	fn handle_command_prompt_key(&mut self, key: KeyEvent) -> AppAction {
+		match key.code {
+			KeyCode::Esc => {
+				self.command_prompt = None;
+				self.status_message = "command cancelled".to_string();
+			}
+			KeyCode::Enter => {
+				if let Err(error) = self.commit_command_prompt() {
+					self.status_message = format!("command failed: {error}");
+				}
+			}
+			KeyCode::Backspace => {
+				if let Some(prompt) = &mut self.command_prompt {
+					if prompt.len() > 1 {
+						prompt.pop();
+					} else {
+						self.command_prompt = None;
+						self.status_message = "command cancelled".to_string();
+					}
+				}
+			}
+			KeyCode::Char(ch)
+				if !key
+					.modifiers
+					.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) =>
+			{
+				self.push_command_prompt_text(&ch.to_string());
+			}
+			_ => {}
+		}
+
+		AppAction::Continue
+	}
+
 	fn handle_project_picker_key(&mut self, key: KeyEvent) -> AppAction {
 		match key.code {
 			KeyCode::Esc => {
-				self.project_picker = None;
-				self.status_message = "project switch cancelled".to_string();
+				if self
+					.project_picker
+					.as_ref()
+					.is_some_and(ProjectPicker::search_active)
+				{
+					if let Some(picker) = &mut self.project_picker {
+						picker.clear_search();
+					}
+					self.status_message = "cleared project search".to_string();
+				} else {
+					self.project_picker = None;
+					self.status_message = "project switch cancelled".to_string();
+				}
 			}
 			KeyCode::Up => {
 				if let Some(picker) = &mut self.project_picker {
+					picker.clear_search();
 					picker.move_selection(-1);
 				}
 			}
 			KeyCode::Down => {
 				if let Some(picker) = &mut self.project_picker {
+					picker.clear_search();
 					picker.move_selection(1);
 				}
 			}
 			KeyCode::Enter => {
-				if let Err(error) = self.commit_project_picker_selection() {
+				if self
+					.project_picker
+					.as_ref()
+					.is_some_and(|picker| picker.search_active() && !picker.has_search_match())
+				{
+					if let Some(picker) = &self.project_picker {
+						self.status_message =
+							format!("no project match for {}", picker.search_query);
+					}
+					return AppAction::Continue;
+				}
+
+				if let Err(error) =
+					self.commit_project_picker_selection(key.modifiers.contains(KeyModifiers::SHIFT))
+				{
 					self.status_message = format!("switch failed: {error}");
 				}
+			}
+			KeyCode::Backspace if self
+				.project_picker
+				.as_ref()
+				.is_some_and(ProjectPicker::search_active) =>
+			{
+				let update = if let Some(picker) = &mut self.project_picker {
+					picker.backspace_search()
+				} else {
+					ProjectPickerSearchUpdate::Unchanged
+				};
+				self.apply_project_picker_search_update(update);
 			}
 			KeyCode::Left | KeyCode::Backspace => {
 				if let Err(error) = self.project_picker_parent() {
@@ -494,6 +687,18 @@ impl App {
 				if let Err(error) = self.project_picker_descend() {
 					self.status_message = format!("switch failed: {error}");
 				}
+			}
+			KeyCode::Char(ch)
+				if !key
+					.modifiers
+					.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) =>
+			{
+				let update = if let Some(picker) = &mut self.project_picker {
+					picker.push_search_text(&ch.to_string())
+				} else {
+					ProjectPickerSearchUpdate::Unchanged
+				};
+				self.apply_project_picker_search_update(update);
 			}
 			_ => {}
 		}
@@ -529,8 +734,8 @@ impl App {
 	}
 
 	fn open_file_in_editor(&mut self, path: PathBuf) -> io::Result<()> {
-		if is_image_path(&path) {
-			self.editor_preview = Some(ImagePreview::load(path.clone())?);
+		if uses_editor_preview(&path) {
+			self.editor_preview = Some(load_editor_preview(path.clone())?);
 			self.mark_file_open(path);
 			let _ = self.persist_session_state(false);
 			return Ok(());
@@ -538,7 +743,7 @@ impl App {
 
 		self.editor_preview = None;
 		if self.nvim.is_exited() {
-			self.nvim = PtyPane::spawn_nvim(path.clone(), self.ui)?;
+			self.nvim = PtyPane::spawn_nvim(path.clone(), self.project_tree.root.clone(), self.ui)?;
 			self.mark_file_open(path);
 			let _ = self.persist_session_state(false);
 			return Ok(());
@@ -556,6 +761,7 @@ impl App {
 	}
 
 	fn begin_project_switch_prompt(&mut self) {
+		self.project_tree.clear_search();
 		let start_dir = self
 			.project_tree
 			.root
@@ -565,7 +771,8 @@ impl App {
 		match ProjectPicker::new(start_dir, Some(self.project_tree.root.clone())) {
 			Ok(picker) => {
 				self.project_picker = Some(picker);
-				self.status_message = "select a project directory".to_string();
+				self.status_message =
+					"select a project. enter opens project, shift+enter opens directory".to_string();
 			}
 			Err(error) => {
 				self.status_message = format!("switch failed: {error}");
@@ -574,6 +781,7 @@ impl App {
 	}
 
 	fn begin_create_prompt(&mut self, kind: CreateKind, base_dir: PathBuf) {
+		self.project_tree.clear_search();
 		let scope = if base_dir == self.project_tree.root {
 			"root".to_string()
 		} else {
@@ -596,13 +804,118 @@ impl App {
 		self.status_message = format!("{label} in {scope}");
 	}
 
+	fn begin_command_prompt(&mut self) {
+		self.project_tree.clear_search();
+		if let Some(picker) = &mut self.project_picker {
+			picker.clear_search();
+		}
+		self.command_prompt = Some(":".to_string());
+		self.status_message = "command mode".to_string();
+	}
+
 	fn push_project_tree_prompt_text(&mut self, text: &str) {
-		self.push_create_prompt_text(text);
+		if self.create_prompt.is_some() {
+			self.push_create_prompt_text(text);
+			return;
+		}
+		if self.command_prompt.is_some() {
+			self.push_command_prompt_text(text);
+			return;
+		}
+		if text.starts_with(':') {
+			self.begin_command_prompt();
+			if let Some(rest) = text.strip_prefix(':') {
+				self.push_command_prompt_text(rest);
+			}
+			return;
+		}
+		if self.project_picker.is_some() {
+			let update = if let Some(picker) = &mut self.project_picker {
+				picker.push_search_text(text)
+			} else {
+				ProjectPickerSearchUpdate::Unchanged
+			};
+			self.apply_project_picker_search_update(update);
+			return;
+		}
+
+		let update = self.project_tree.push_search_text(text);
+		self.apply_project_tree_search_update(update);
 	}
 
 	fn push_create_prompt_text(&mut self, text: &str) {
 		if let Some(prompt) = &mut self.create_prompt {
 			prompt.input.push_str(text);
+		}
+	}
+
+	fn push_command_prompt_text(&mut self, text: &str) {
+		if let Some(prompt) = &mut self.command_prompt {
+			let sanitized = text
+				.chars()
+				.filter(|ch| *ch != '\n' && *ch != '\r')
+				.collect::<String>();
+			prompt.push_str(&sanitized);
+		}
+	}
+
+	fn apply_project_tree_search_update(&mut self, update: TreeSearchUpdate) {
+		match update {
+			TreeSearchUpdate::Cleared => {
+				self.status_message = "cleared tree search".to_string();
+			}
+			TreeSearchUpdate::Matched(path) => {
+				self.status_message =
+					format!("tree search: {}", relative_to_root(&self.project_tree.root, &path));
+			}
+			TreeSearchUpdate::NoMatch => {
+				self.status_message = format!("no match for {}", self.project_tree.search_query);
+			}
+			TreeSearchUpdate::Unchanged => {}
+		}
+	}
+
+	fn apply_project_picker_search_update(&mut self, update: ProjectPickerSearchUpdate) {
+		match update {
+			ProjectPickerSearchUpdate::Cleared => {
+				self.status_message = "cleared project search".to_string();
+			}
+			ProjectPickerSearchUpdate::Matched(path) => {
+				if let Some(picker) = &self.project_picker {
+					self.status_message =
+						format!("project search: {}", relative_to_root(&picker.current_dir, &path));
+				}
+			}
+			ProjectPickerSearchUpdate::NoMatch => {
+				if let Some(picker) = &self.project_picker {
+					self.status_message = format!("no project match for {}", picker.search_query);
+				}
+			}
+			ProjectPickerSearchUpdate::Unchanged => {}
+		}
+	}
+
+	fn commit_command_prompt(&mut self) -> io::Result<()> {
+		let Some(command) = self.command_prompt.as_ref() else {
+			return Ok(());
+		};
+
+		let trimmed = command.trim();
+		let mut parts = trimmed.split_whitespace();
+		match (parts.next(), parts.next(), parts.next(), parts.next(), parts.next()) {
+			(Some(":set"), Some("accent"), Some(value), None, None) => {
+				let hex = normalize_hex_color(value).ok_or_else(|| {
+					io_error("usage: :set accent #RRGGBB")
+				})?;
+				self.ui = ui_theme(&hex);
+				if !self.nvim.is_exited() {
+					self.nvim.apply_theme(self.ui)?;
+				}
+				self.command_prompt = None;
+				self.status_message = format!("accent set to {hex}");
+				Ok(())
+			}
+			_ => Err(io_error("unknown command")),
 		}
 	}
 
@@ -652,7 +965,7 @@ impl App {
 		Ok(())
 	}
 
-	fn commit_project_picker_selection(&mut self) -> io::Result<()> {
+	fn commit_project_picker_selection(&mut self, open_directory: bool) -> io::Result<()> {
 		let Some(path) = self
 			.project_picker
 			.as_ref()
@@ -661,7 +974,13 @@ impl App {
 			return Ok(());
 		};
 
-		self.switch_project(path)?;
+		let root = if open_directory {
+			path
+		} else {
+			default_project_root(&path)
+		};
+
+		self.switch_project(root)?;
 		self.project_picker = None;
 		Ok(())
 	}
@@ -670,12 +989,13 @@ impl App {
 		let Some(picker) = &mut self.project_picker else {
 			return Ok(());
 		};
-		let Some(parent) = picker.current_dir.parent() else {
+		let Some(parent) = picker.current_dir.parent().map(Path::to_path_buf) else {
 			return Ok(());
 		};
 
 		let previous = picker.current_dir.clone();
-		picker.set_dir(parent.to_path_buf(), Some(previous))?;
+		picker.clear_search();
+		picker.set_dir(parent, Some(previous))?;
 		self.status_message = format!("browsing {}", picker.current_dir.display());
 		Ok(())
 	}
@@ -688,6 +1008,7 @@ impl App {
 			return Ok(());
 		};
 
+		picker.clear_search();
 		picker.set_dir(path.clone(), None)?;
 		self.status_message = format!("browsing {}", path.display());
 		Ok(())
@@ -702,9 +1023,9 @@ impl App {
 		project_tree.select_path(&target);
 
 		self.terminal = PtyPane::spawn_shell(root.clone())?;
-		self.nvim = PtyPane::spawn_nvim(editor_target, self.ui)?;
-		self.editor_preview = is_image_path(&target)
-			.then(|| ImagePreview::load(target.clone()))
+		self.nvim = PtyPane::spawn_nvim(editor_target, root.clone(), self.ui)?;
+		self.editor_preview = uses_editor_preview(&target)
+			.then(|| load_editor_preview(target.clone()))
 			.transpose()?;
 		self.project_tree = project_tree;
 		self.codex_api_key = load_codex_pi_key(&root).unwrap_or_else(|| "render-it-here".to_string());
@@ -814,7 +1135,7 @@ impl App {
 			self.open_files.push(initial_editor_target.clone());
 		}
 
-		for path in files.iter().filter(|path| !is_image_path(path)) {
+		for path in files.iter().filter(|path| !uses_editor_preview(path)) {
 			if *path == initial_editor_target {
 				continue;
 			}
@@ -822,16 +1143,16 @@ impl App {
 		}
 
 		if let Some(active_file) = active_file {
-			if is_image_path(&active_file) {
-				self.editor_preview = Some(ImagePreview::load(active_file.clone())?);
+			if uses_editor_preview(&active_file) {
+				self.editor_preview = Some(load_editor_preview(active_file.clone())?);
 			} else {
 				self.editor_preview = None;
 				if active_file != initial_editor_target {
 					self.nvim.open_file(&active_file)?;
 				}
 			}
-		} else if is_image_path(&initial_editor_target) {
-			self.editor_preview = Some(ImagePreview::load(initial_editor_target.clone())?);
+		} else if uses_editor_preview(&initial_editor_target) {
+			self.editor_preview = Some(load_editor_preview(initial_editor_target.clone())?);
 			self.active_file = Some(initial_editor_target);
 		} else if self.active_file.is_none() {
 			self.active_file = Some(initial_editor_target);
@@ -853,7 +1174,7 @@ impl App {
 
 		if sync_nvim {
 			if let Some(nvim_state) = self.snapshot_nvim_state()? {
-				open_files.retain(|path| is_image_path(path));
+				open_files.retain(|path| uses_editor_preview(path));
 				for path in nvim_state.files {
 					if !open_files.iter().any(|existing| existing == &path) {
 						open_files.push(path);
@@ -866,10 +1187,10 @@ impl App {
 		}
 
 		if let Some(preview) = &self.editor_preview {
-			if !open_files.iter().any(|path| path == &preview.path) {
-				open_files.push(preview.path.clone());
+			if !open_files.iter().any(|path| path == preview.path()) {
+				open_files.push(preview.path().to_path_buf());
 			}
-			active_file = Some(preview.path.clone());
+			active_file = Some(preview.path().to_path_buf());
 		}
 
 		open_files = sanitize_session_files(&self.project_tree.root, &open_files);
@@ -1083,7 +1404,7 @@ impl TerminalMetrics {
 }
 
 impl PtyPane {
-	fn spawn_nvim(file_path: PathBuf, ui: UiTheme) -> io::Result<Self> {
+	fn spawn_nvim(file_path: PathBuf, cwd: PathBuf, ui: UiTheme) -> io::Result<Self> {
 		let mut cmd = CommandBuilder::new("nvim");
 		cmd.arg("--clean");
 		cmd.arg("-n");
@@ -1101,7 +1422,7 @@ impl PtyPane {
 		cmd.arg(
 			"+cnoreabbrev <expr> x getcmdtype() == ':' && getcmdline() ==# 'x' ? 'VeditorClose' : 'x'",
 		);
-		cmd.cwd(env::current_dir()?);
+		cmd.cwd(cwd);
 		cmd.env("TERM", "xterm-256color");
 		Self::spawn("nvim", cmd)
 	}
@@ -1214,6 +1535,12 @@ impl PtyPane {
 	fn open_file(&mut self, path: &Path) -> io::Result<()> {
 		let escaped = escape_nvim_path(path);
 		let command = format!("\x1b:drop {escaped}\r");
+		self.writer.write_all(command.as_bytes())?;
+		self.writer.flush()
+	}
+
+	fn apply_theme(&mut self, ui: UiTheme) -> io::Result<()> {
+		let command = format!("\x1b:lua {}\r", nvim_theme_lua(ui));
 		self.writer.write_all(command.as_bytes())?;
 		self.writer.flush()
 	}
@@ -1385,6 +1712,9 @@ impl ProjectTree {
 			expanded,
 			visible: Vec::new(),
 			selected: 0,
+			search_query: String::new(),
+			search_match: None,
+			last_search_input: None,
 		};
 		tree.refresh(None);
 		tree
@@ -1408,21 +1738,8 @@ impl ProjectTree {
 	}
 
 	fn collect_entries(&mut self, dir: &Path, depth: usize) {
-		let Ok(read_dir) = fs::read_dir(dir) else {
-			return;
-		};
-
-		let mut paths = read_dir.filter_map(Result::ok).collect::<Vec<_>>();
-		paths.sort_by_key(|entry| entry.path());
-
-		for entry in paths {
-			let path = entry.path();
-			let name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+		for path in sorted_project_entries(dir) {
 			let is_dir = path.is_dir();
-			if (is_dir && name.starts_with('.')) || name == "target" || name.ends_with(".swp") {
-				continue;
-			}
-
 			self.visible.push(TreeEntry {
 				path: path.clone(),
 				depth,
@@ -1474,6 +1791,122 @@ impl ProjectTree {
 			}
 		}
 	}
+
+	fn search_active(&self) -> bool {
+		!self.search_query.is_empty()
+	}
+
+	fn has_search_match(&self) -> bool {
+		self.search_match.is_some()
+	}
+
+	fn clear_search(&mut self) {
+		self.search_query.clear();
+		self.search_match = None;
+		self.last_search_input = None;
+	}
+
+	fn expire_search(&mut self) {
+		if self
+			.last_search_input
+			.is_some_and(|timestamp| timestamp.elapsed() >= PROJECT_TREE_SEARCH_TIMEOUT)
+		{
+			self.clear_search();
+		}
+	}
+
+	fn push_search_text(&mut self, text: &str) -> TreeSearchUpdate {
+		self.expire_search();
+
+		let sanitized = text
+			.chars()
+			.filter(|ch| *ch != '\n' && *ch != '\r')
+			.collect::<String>();
+		if sanitized.is_empty() {
+			return TreeSearchUpdate::Unchanged;
+		}
+
+		self.search_query.push_str(&sanitized);
+		self.last_search_input = Some(Instant::now());
+		self.select_search_match()
+	}
+
+	fn backspace_search(&mut self) -> TreeSearchUpdate {
+		if self.search_query.is_empty() {
+			return TreeSearchUpdate::Unchanged;
+		}
+
+		self.search_query.pop();
+		if self.search_query.is_empty() {
+			self.clear_search();
+			return TreeSearchUpdate::Cleared;
+		}
+
+		self.last_search_input = Some(Instant::now());
+		self.select_search_match()
+	}
+
+	fn select_search_match(&mut self) -> TreeSearchUpdate {
+		if self.search_query.is_empty() {
+			self.search_match = None;
+			return TreeSearchUpdate::Cleared;
+		}
+
+		let Some(path) = self.find_match(&self.search_query) else {
+			self.search_match = None;
+			return TreeSearchUpdate::NoMatch;
+		};
+
+		self.expand_to(&path);
+		self.refresh(Some(path.clone()));
+		self.search_match = Some(path.clone());
+		TreeSearchUpdate::Matched(path)
+	}
+
+	fn find_match(&self, query: &str) -> Option<PathBuf> {
+		let needle = query.trim().to_lowercase();
+		if needle.is_empty() {
+			return None;
+		}
+
+		let mut prefix = None;
+		let mut contains = None;
+		self.find_match_in_dir(&self.root, &needle, &mut prefix, &mut contains);
+		prefix.or(contains)
+	}
+
+	fn find_match_in_dir(
+		&self,
+		dir: &Path,
+		needle: &str,
+		prefix: &mut Option<PathBuf>,
+		contains: &mut Option<PathBuf>,
+	) {
+		for path in sorted_project_entries(dir) {
+			let label = path
+				.file_name()
+				.and_then(|name| name.to_str())
+				.unwrap_or_default()
+				.to_lowercase();
+			let relative = relative_to_root(&self.root, &path).to_lowercase();
+
+			if prefix.is_none() && (label.starts_with(needle) || relative.starts_with(needle)) {
+				*prefix = Some(path.clone());
+			}
+			if contains.is_none() && (label.contains(needle) || relative.contains(needle)) {
+				*contains = Some(path.clone());
+			}
+			if prefix.is_some() && contains.is_some() {
+				return;
+			}
+			if path.is_dir() {
+				self.find_match_in_dir(&path, needle, prefix, contains);
+				if prefix.is_some() && contains.is_some() {
+					return;
+				}
+			}
+		}
+	}
 }
 
 impl ProjectPicker {
@@ -1482,37 +1915,17 @@ impl ProjectPicker {
 			current_dir,
 			entries: Vec::new(),
 			selected: 0,
+			search_query: String::new(),
+			search_match: None,
+			last_search_input: None,
 		};
 		picker.refresh(selected_path)?;
 		Ok(picker)
 	}
 
 	fn refresh(&mut self, selected_path: Option<PathBuf>) -> io::Result<()> {
-		let read_dir = fs::read_dir(&self.current_dir)?;
-		let mut dirs = read_dir
-			.filter_map(Result::ok)
-			.map(|entry| entry.path())
-			.filter(|path| path.is_dir())
-			.filter(|path| {
-				path.file_name()
-					.and_then(|name| name.to_str())
-					.map(|name| !name.starts_with('.') && name != "target")
-					.unwrap_or(true)
-			})
-			.collect::<Vec<_>>();
-		dirs.sort();
-
-		self.entries = dirs
-			.into_iter()
-			.map(|path| ProjectPickerEntry {
-				label: path
-					.file_name()
-					.and_then(|name| name.to_str())
-					.unwrap_or_else(|| path.to_str().unwrap_or_default())
-					.to_string(),
-				path,
-			})
-			.collect();
+		self.entries = project_picker_entries(&self.current_dir)?;
+		self.search_match = None;
 
 		if self.entries.is_empty() {
 			self.selected = 0;
@@ -1552,6 +1965,95 @@ impl ProjectPicker {
 	fn selected_path(&self) -> Option<PathBuf> {
 		self.entries.get(self.selected).map(|entry| entry.path.clone())
 	}
+
+	fn search_active(&self) -> bool {
+		!self.search_query.is_empty()
+	}
+
+	fn has_search_match(&self) -> bool {
+		self.search_match.is_some()
+	}
+
+	fn clear_search(&mut self) {
+		self.search_query.clear();
+		self.search_match = None;
+		self.last_search_input = None;
+	}
+
+	fn expire_search(&mut self) {
+		if self
+			.last_search_input
+			.is_some_and(|timestamp| timestamp.elapsed() >= PROJECT_TREE_SEARCH_TIMEOUT)
+		{
+			self.clear_search();
+		}
+	}
+
+	fn push_search_text(&mut self, text: &str) -> ProjectPickerSearchUpdate {
+		self.expire_search();
+
+		let sanitized = text
+			.chars()
+			.filter(|ch| *ch != '\n' && *ch != '\r')
+			.collect::<String>();
+		if sanitized.is_empty() {
+			return ProjectPickerSearchUpdate::Unchanged;
+		}
+
+		self.search_query.push_str(&sanitized);
+		self.last_search_input = Some(Instant::now());
+		self.select_search_match()
+	}
+
+	fn backspace_search(&mut self) -> ProjectPickerSearchUpdate {
+		if self.search_query.is_empty() {
+			return ProjectPickerSearchUpdate::Unchanged;
+		}
+
+		self.search_query.pop();
+		if self.search_query.is_empty() {
+			self.clear_search();
+			return ProjectPickerSearchUpdate::Cleared;
+		}
+
+		self.last_search_input = Some(Instant::now());
+		self.select_search_match()
+	}
+
+	fn select_search_match(&mut self) -> ProjectPickerSearchUpdate {
+		if self.search_query.is_empty() {
+			self.search_match = None;
+			return ProjectPickerSearchUpdate::Cleared;
+		}
+
+		let needle = self.search_query.trim().to_lowercase();
+		if needle.is_empty() {
+			self.clear_search();
+			return ProjectPickerSearchUpdate::Cleared;
+		}
+
+		let Some(path) = find_project_picker_match(&self.current_dir, &needle) else {
+			self.search_match = None;
+			return ProjectPickerSearchUpdate::NoMatch;
+		};
+
+		if let Some(index) = self.entries.iter().position(|entry| entry.path == path) {
+			self.selected = index;
+		} else {
+			let Some(parent) = path.parent() else {
+				self.search_match = None;
+				return ProjectPickerSearchUpdate::NoMatch;
+			};
+			self.current_dir = parent.to_path_buf();
+			if let Err(_) = self.refresh(Some(path.clone())) {
+				self.search_match = None;
+				return ProjectPickerSearchUpdate::NoMatch;
+			}
+		}
+
+		self.search_match = Some(path.clone());
+		ProjectPickerSearchUpdate::Matched(path)
+	}
 }
 
 impl ImagePreview {
@@ -1560,7 +2062,106 @@ impl ImagePreview {
 			.map_err(io_error)?
 			.decode()
 			.map_err(io_error)?;
-		Ok(Self { path, image })
+		Ok(Self {
+			path,
+			image,
+			cache: None,
+		})
+	}
+
+	fn lines(&mut self, width: u16, height: u16, ui: UiTheme) -> &[Line<'static>] {
+		let refresh = self
+			.cache
+			.as_ref()
+			.is_none_or(|cache| cache.width != width || cache.height != height || cache.panel != ui.panel);
+		if refresh {
+			self.cache = Some(ImagePreviewCache {
+				width,
+				height,
+				panel: ui.panel,
+				lines: build_image_preview_lines(&self.image, width, height, ui),
+			});
+		}
+
+		self.cache
+			.as_ref()
+			.map(|cache| cache.lines.as_slice())
+			.unwrap_or(&[])
+	}
+}
+
+impl DocumentPreview {
+	fn load(path: PathBuf) -> io::Result<Self> {
+		if is_pdf_path(&path) {
+			Self::load_pdf(path)
+		} else if is_notebook_path(&path) {
+			Self::load_notebook(path)
+		} else {
+			Err(io_error("unsupported document preview"))
+		}
+	}
+
+	fn load_pdf(path: PathBuf) -> io::Result<Self> {
+		let text = pdf_extract::extract_text(&path).map_err(io_error)?;
+		let (lines, truncated) = preview_lines_from_iter(text.lines().map(str::to_string));
+		let summary = if truncated {
+			format!("pdf text preview  showing first {DOCUMENT_PREVIEW_MAX_LINES} lines")
+		} else {
+			"pdf text preview".to_string()
+		};
+		Ok(Self {
+			path,
+			kind: "pdf",
+			summary,
+			lines,
+		})
+	}
+
+	fn load_notebook(path: PathBuf) -> io::Result<Self> {
+		let contents = fs::read_to_string(&path)?;
+		let value: serde_json::Value = serde_json::from_str(&contents).map_err(io_error)?;
+		let cells = value
+			.get("cells")
+			.and_then(serde_json::Value::as_array)
+			.ok_or_else(|| io_error("notebook missing cells"))?;
+
+		let mut rendered = Vec::new();
+		for (index, cell) in cells.iter().enumerate() {
+			if index > 0 {
+				rendered.push(String::new());
+			}
+
+			let cell_type = cell
+				.get("cell_type")
+				.and_then(serde_json::Value::as_str)
+				.unwrap_or("cell");
+			rendered.push(format!("[{cell_type} {}]", index + 1));
+
+			for line in notebook_lines(cell.get("source")) {
+				rendered.push(line);
+			}
+
+			for line in notebook_output_lines(cell.get("outputs")) {
+				rendered.push(line);
+			}
+		}
+
+		if rendered.is_empty() {
+			rendered.push("notebook is empty".to_string());
+		}
+
+		let (lines, truncated) = preview_lines_from_iter(rendered.into_iter());
+		let summary = if truncated {
+			format!("notebook preview  showing first {DOCUMENT_PREVIEW_MAX_LINES} lines")
+		} else {
+			"notebook preview".to_string()
+		};
+		Ok(Self {
+			path,
+			kind: "ipynb",
+			summary,
+			lines,
+		})
 	}
 }
 
@@ -1596,8 +2197,15 @@ fn render(frame: &mut Frame, app: &mut App) {
 }
 
 fn render_editor(frame: &mut Frame, area: Rect, app: &mut App) {
-	if let Some(preview) = &app.editor_preview {
-		render_image_preview(frame, area, app.ui, app.focus == Focus::Editor, preview);
+	if let Some(preview) = &mut app.editor_preview {
+		match preview {
+			EditorPreview::Image(preview) => {
+				render_image_preview(frame, area, app.ui, app.focus == Focus::Editor, preview);
+			}
+			EditorPreview::Document(preview) => {
+				render_document_preview(frame, area, app.ui, app.focus == Focus::Editor, preview);
+			}
+		}
 	} else {
 		render_pty_pane(frame, area, app.ui, app.focus == Focus::Editor, &mut app.nvim);
 	}
@@ -1639,7 +2247,7 @@ fn render_image_preview(
 	area: Rect,
 	ui: UiTheme,
 	focused: bool,
-	preview: &ImagePreview,
+	preview: &mut ImagePreview,
 ) {
 	let title = format!(
 		" image  {} ",
@@ -1676,13 +2284,58 @@ fn render_image_preview(
 	.style(Style::default().bg(ui.panel));
 	frame.render_widget(meta, meta_area);
 
-	let lines = build_image_preview_lines(preview, preview_area.width, preview_area.height, ui);
-	let widget = Paragraph::new(lines).style(Style::default().bg(ui.panel));
+	let widget = Paragraph::new(preview.lines(preview_area.width, preview_area.height, ui).to_vec())
+		.style(Style::default().bg(ui.panel));
+	frame.render_widget(widget, preview_area);
+}
+
+fn render_document_preview(
+	frame: &mut Frame,
+	area: Rect,
+	ui: UiTheme,
+	focused: bool,
+	preview: &DocumentPreview,
+) {
+	let title = format!(
+		" {}  {} ",
+		preview.kind,
+		preview
+			.path
+			.file_name()
+			.and_then(|name| name.to_str())
+			.unwrap_or("preview")
+	);
+	let block = panel(&title, ui, focused);
+	let inner = block.inner(area);
+	frame.render_widget(block, area);
+
+	if inner.width == 0 || inner.height == 0 {
+		return;
+	}
+
+	let [meta_area, preview_area] = Layout::default()
+		.direction(Direction::Vertical)
+		.constraints([Constraint::Length(2), Constraint::Min(1)])
+		.areas(inner);
+
+	let meta = Paragraph::new(vec![
+		Line::styled(
+			preview.path.display().to_string(),
+			Style::default().fg(ui.accent).add_modifier(Modifier::BOLD),
+		),
+		Line::styled(preview.summary.clone(), Style::default().fg(ui.muted)),
+	])
+	.style(Style::default().bg(ui.panel));
+	frame.render_widget(meta, meta_area);
+
+	let widget = Paragraph::new(preview.lines.clone())
+		.style(Style::default().bg(ui.panel).fg(ui.text))
+		.wrap(Wrap { trim: false });
 	frame.render_widget(widget, preview_area);
 }
 
 fn build_image_preview_lines(
-	preview: &ImagePreview,
+	image: &DynamicImage,
 	width: u16,
 	height: u16,
 	ui: UiTheme,
@@ -1693,9 +2346,8 @@ fn build_image_preview_lines(
 
 	let target_width = width as u32;
 	let target_height = height as u32 * 2;
-	let resized = preview
-		.image
-		.thumbnail(target_width.max(1), target_height.max(1))
+	let resized = image
+		.resize(target_width.max(1), target_height.max(1), FilterType::Lanczos3)
 		.to_rgba8();
 	let image_width = resized.width() as u16;
 	let image_height = resized.height() as u16;
@@ -1755,6 +2407,40 @@ fn build_image_preview_lines(
 }
 
 fn project_tree(frame: &mut Frame, area: Rect, app: &App) {
+	let title = if let Some(picker) = &app.project_picker {
+		if picker.search_active() {
+			format!(
+				" open project  {}  search: {} ",
+				picker.current_dir.display(),
+				picker.search_query
+			)
+		} else {
+			format!(" open project  {} ", picker.current_dir.display())
+		}
+	} else if app.project_tree.search_active() {
+		format!("project tree  search: {}", app.project_tree.search_query)
+	} else {
+		"project tree".to_string()
+	};
+
+	let block = panel(&title, app.ui, app.focus == Focus::ProjectTree);
+	let inner = block.inner(area);
+	frame.render_widget(block, area);
+
+	if inner.width == 0 || inner.height == 0 {
+		return;
+	}
+
+	let (list_area, command_area) = if app.command_prompt.is_some() {
+		let [list_area, command_area] = Layout::default()
+			.direction(Direction::Vertical)
+			.constraints([Constraint::Min(1), Constraint::Length(4)])
+			.areas(inner);
+		(list_area, Some(command_area))
+	} else {
+		(inner, None)
+	};
+
 	if let Some(picker) = &app.project_picker {
 		let items = picker
 			.entries
@@ -1770,9 +2456,7 @@ fn project_tree(frame: &mut Frame, area: Rect, app: &App) {
 			})
 			.collect::<Vec<_>>();
 
-		let title = format!(" open project  {} ", picker.current_dir.display());
 		let list = List::new(items)
-			.block(panel(&title, app.ui, app.focus == Focus::ProjectTree))
 			.highlight_style(
 				Style::default()
 					.fg(app.ui.bg)
@@ -1784,76 +2468,109 @@ fn project_tree(frame: &mut Frame, area: Rect, app: &App) {
 		if !picker.entries.is_empty() {
 			state.select(Some(picker.selected));
 		}
-		frame.render_stateful_widget(list, area, &mut state);
-		return;
-	}
+		frame.render_stateful_widget(list, list_area, &mut state);
+	} else {
+		let items = app
+			.project_tree
+			.visible
+			.iter()
+			.enumerate()
+			.map(|(index, entry)| {
+				let label = entry
+					.path
+					.file_name()
+					.and_then(|name| name.to_str())
+					.unwrap_or_else(|| entry.path.to_str().unwrap_or_default())
+					.to_string();
+				let indent = "   ".repeat(entry.depth);
+				let is_selected = index == app.project_tree.selected;
+				let is_startup = entry.path == app.project_tree.root.join(STARTUP_FILE);
+				let row_style = if is_selected {
+					Style::default()
+						.fg(app.ui.bg)
+						.bg(app.ui.accent)
+						.add_modifier(Modifier::BOLD)
+				} else if is_startup {
+					Style::default().fg(app.ui.accent).add_modifier(Modifier::BOLD)
+				} else {
+					Style::default().fg(app.ui.text)
+				};
+				let accent_style = if is_selected {
+					row_style
+				} else {
+					row_style.fg(app.ui.accent)
+				};
+				let toggle = if entry.is_dir {
+					if app.project_tree.expanded.contains(&entry.path) {
+						"▾"
+					} else {
+						"▸"
+					}
+				} else {
+					" "
+				};
+				let icon = if entry.is_dir { "󰉋" } else { "󰈔" };
 
-	let items = app
-		.project_tree
-		.visible
-		.iter()
-		.enumerate()
-		.map(|(index, entry)| {
-			let label = entry
-				.path
-				.file_name()
-				.and_then(|name| name.to_str())
-				.unwrap_or_else(|| entry.path.to_str().unwrap_or_default())
-				.to_string();
-			let indent = "   ".repeat(entry.depth);
-			let is_selected = index == app.project_tree.selected;
-			let is_startup = entry.path == app.project_tree.root.join(STARTUP_FILE);
-			let row_style = if is_selected {
+				ListItem::new(Line::from(vec![
+					Span::styled(indent, row_style),
+					Span::styled(toggle, accent_style),
+					Span::styled("  ", row_style),
+					Span::styled(icon, accent_style),
+					Span::styled("  ", row_style),
+					Span::styled(label, row_style),
+				]))
+			})
+			.collect::<Vec<_>>();
+
+		let tree = List::new(items)
+			.highlight_style(
 				Style::default()
 					.fg(app.ui.bg)
 					.bg(app.ui.accent)
-					.add_modifier(Modifier::BOLD)
-			} else if is_startup {
-				Style::default().fg(app.ui.accent).add_modifier(Modifier::BOLD)
-			} else {
-				Style::default().fg(app.ui.text)
-			};
-			let accent_style = if is_selected {
-				row_style
-			} else {
-				row_style.fg(app.ui.accent)
-			};
-			let toggle = if entry.is_dir {
-				if app.project_tree.expanded.contains(&entry.path) {
-					"▾"
-				} else {
-					"▸"
-				}
-			} else {
-				" "
-			};
-			let icon = if entry.is_dir { "󰉋" } else { "󰈔" };
-
-			ListItem::new(Line::from(vec![
-				Span::styled(indent, row_style),
-				Span::styled(toggle, accent_style),
-				Span::styled("  ", row_style),
-				Span::styled(icon, accent_style),
-				Span::styled("  ", row_style),
-				Span::styled(label, row_style),
-			]))
-		})
-		.collect::<Vec<_>>();
-
-	let tree = List::new(items)
-		.block(panel("project tree", app.ui, app.focus == Focus::ProjectTree))
-		.highlight_style(
-			Style::default()
-				.fg(app.ui.bg)
-				.bg(app.ui.accent)
-				.add_modifier(Modifier::BOLD),
-		)
-		.highlight_symbol(" ");
-	let mut state = ListState::default();
-	if !app.project_tree.visible.is_empty() {
-		state.select(Some(app.project_tree.selected));
+					.add_modifier(Modifier::BOLD),
+			)
+			.highlight_symbol(" ");
+		let mut state = ListState::default();
+		if !app.project_tree.visible.is_empty() {
+			state.select(Some(app.project_tree.selected));
+		}
+		frame.render_stateful_widget(tree, list_area, &mut state);
 	}
-	frame.render_stateful_widget(tree, area, &mut state);
+
+	if let (Some(command), Some(command_area)) = (&app.command_prompt, command_area) {
+		let command_block = Block::bordered()
+			.border_style(Style::default().fg(app.ui.border))
+			.style(Style::default().bg(app.ui.panel_alt))
+			.title(Line::styled(
+				" command  enter run  esc cancel ",
+				Style::default().fg(app.ui.accent).add_modifier(Modifier::BOLD),
+			));
+		let command_inner = command_block.inner(command_area);
+		let command_widget = Paragraph::new(Line::from(vec![
+			Span::styled(":", Style::default().fg(app.ui.accent).add_modifier(Modifier::BOLD)),
+			Span::styled(
+				command
+					.strip_prefix(':')
+					.map(str::to_string)
+					.unwrap_or_else(|| command.clone()),
+				Style::default().fg(app.ui.text),
+			),
+		]))
+		.block(command_block)
+		.wrap(Wrap { trim: false });
+		frame.render_widget(command_widget, command_area);
+
+		let cursor_x = command_inner
+			.x
+			.saturating_add(command.chars().count() as u16);
+		let cursor_y = command_inner.y;
+		if cursor_x < command_inner.right()
+			&& cursor_y < command_inner.bottom()
+			&& app.focus == Focus::ProjectTree
+		{
+			frame.set_cursor_position((cursor_x, cursor_y));
+		}
+	}
 }
 
 fn performance_block(frame: &mut Frame, area: Rect, app: &App) {
@@ -2057,7 +2774,7 @@ fn vt_color_to_ratatui(color: VtColor, default: Color) -> Color {
 }
 
 fn ansi_index_to_color(idx: u8) -> Color {
-	let ui = ui_theme();
+	let ui = ui_theme(ACCENT_COLOR);
 	match idx {
 		0..=15 => ui.ansi[idx as usize],
 		16..=231 => {
@@ -2101,6 +2818,13 @@ fn is_project_open_shortcut(key: KeyEvent) -> bool {
 	command_mod && matches!(key.code, KeyCode::Char('o') | KeyCode::Char('O'))
 }
 
+fn is_command_prompt_start(key: KeyEvent) -> bool {
+	!key
+		.modifiers
+		.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+		&& matches!(key.code, KeyCode::Char(':'))
+}
+
 fn default_project_target(root: &Path) -> PathBuf {
 	let startup = root.join(STARTUP_FILE);
 	if startup.is_file() {
@@ -2124,16 +2848,24 @@ fn resolve_startup_target(root: &Path, requested: &Path) -> PathBuf {
 	}
 }
 
+fn absolutize_path(base: &Path, path: &Path) -> PathBuf {
+	if path.is_absolute() {
+		path.to_path_buf()
+	} else {
+		base.join(path)
+	}
+}
+
 fn initial_editor_target(root: &Path, files: &[PathBuf], fallback: &Path) -> PathBuf {
 	let candidate = files
 		.iter()
-		.find(|path| !is_image_path(path))
+		.find(|path| !uses_editor_preview(path))
 		.cloned()
 		.unwrap_or_else(|| resolve_startup_target(root, fallback));
 
-	if is_image_path(&candidate) {
+	if uses_editor_preview(&candidate) {
 		let default_target = default_project_target(root);
-		if is_image_path(&default_target) {
+		if uses_editor_preview(&default_target) {
 			root.to_path_buf()
 		} else {
 			default_target
@@ -2312,6 +3044,123 @@ fn relative_to_root(root: &Path, path: &Path) -> String {
 		Ok(relative) => relative.display().to_string(),
 		Err(_) => path.display().to_string(),
 	}
+}
+
+fn project_picker_entries(root: &Path) -> io::Result<Vec<ProjectPickerEntry>> {
+	let read_dir = fs::read_dir(root)?;
+	let mut dirs = read_dir
+		.filter_map(Result::ok)
+		.map(|entry| entry.path())
+		.filter(|path| path.is_dir())
+		.filter(|path| {
+			path.file_name()
+				.and_then(|name| name.to_str())
+				.map(|name| !name.starts_with('.') && name != "target")
+				.unwrap_or(true)
+		})
+		.collect::<Vec<_>>();
+	dirs.sort();
+
+	Ok(dirs
+		.into_iter()
+		.map(|path| ProjectPickerEntry {
+			label: path
+				.file_name()
+				.and_then(|name| name.to_str())
+				.unwrap_or_else(|| path.to_str().unwrap_or_default())
+				.to_string(),
+			path,
+		})
+		.collect())
+}
+
+fn find_project_picker_match(root: &Path, needle: &str) -> Option<PathBuf> {
+	let mut prefix = None;
+	let mut contains = None;
+	find_project_picker_match_in_dir(root, root, needle, &mut prefix, &mut contains);
+	prefix.or(contains)
+}
+
+fn find_project_picker_match_in_dir(
+	root: &Path,
+	dir: &Path,
+	needle: &str,
+	prefix: &mut Option<PathBuf>,
+	contains: &mut Option<PathBuf>,
+) {
+	for path in sorted_project_entries(dir) {
+		if !path.is_dir() {
+			continue;
+		}
+
+		let label = path
+			.file_name()
+			.and_then(|name| name.to_str())
+			.unwrap_or_default()
+			.to_lowercase();
+		let relative = relative_to_root(root, &path).to_lowercase();
+
+		if prefix.is_none() && (label.starts_with(needle) || relative.starts_with(needle)) {
+			*prefix = Some(path.clone());
+		}
+		if contains.is_none() && (label.contains(needle) || relative.contains(needle)) {
+			*contains = Some(path.clone());
+		}
+		if prefix.is_some() && contains.is_some() {
+			return;
+		}
+
+		find_project_picker_match_in_dir(root, &path, needle, prefix, contains);
+		if prefix.is_some() && contains.is_some() {
+			return;
+		}
+	}
+}
+
+fn default_project_root(root: &Path) -> PathBuf {
+	let startup = root.join(STARTUP_FILE);
+	if startup.is_file() {
+		return root.to_path_buf();
+	}
+
+	find_first_project_root(root).unwrap_or_else(|| root.to_path_buf())
+}
+
+fn sorted_project_entries(dir: &Path) -> Vec<PathBuf> {
+	let Ok(read_dir) = fs::read_dir(dir) else {
+		return Vec::new();
+	};
+
+	let mut paths = read_dir
+		.filter_map(Result::ok)
+		.map(|entry| entry.path())
+		.collect::<Vec<_>>();
+	paths.sort();
+	paths
+		.into_iter()
+		.filter(|path| {
+			let name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+			let is_dir = path.is_dir();
+			!((is_dir && name.starts_with('.')) || name == "target" || name.ends_with(".swp"))
+		})
+		.collect()
+}
+
+fn find_first_project_root(dir: &Path) -> Option<PathBuf> {
+	let entries = sorted_project_entries(dir);
+	if entries.iter().any(|path| path.is_file()) {
+		return Some(dir.to_path_buf());
+	}
+
+	for path in entries {
+		if path.is_dir() {
+			if let Some(child) = find_first_project_root(&path) {
+				return Some(child);
+			}
+		}
+	}
+
+	None
 }
 
 fn request_codex_reply(api_key: &str, working_project: &Path, transcript: &str) -> Result<String, String> {
@@ -2530,56 +3379,53 @@ fn is_key_press(kind: KeyEventKind) -> bool {
 	matches!(kind, KeyEventKind::Press | KeyEventKind::Repeat)
 }
 
-fn ui_theme() -> UiTheme {
-	static THEME: OnceLock<UiTheme> = OnceLock::new();
-	*THEME.get_or_init(|| {
-		let accent = color_to_rgb(parse_hex_color(ACCENT_COLOR).unwrap_or(Color::Rgb(30, 144, 255)));
-		let bg = mix(rgb(3, 4, 8), accent, 0.10);
-		let panel = mix(rgb(7, 10, 18), accent, 0.16);
-		let panel_alt = mix(rgb(12, 16, 28), accent, 0.24);
-		let accent_soft = mix(accent, rgb(255, 255, 255), 0.24);
-		let accent_dim = mix(accent, bg, 0.38);
-		let text = mix(rgb(245, 247, 250), accent, 0.18);
-		let muted = mix(text, panel_alt, 0.44);
-		let border = mix(panel_alt, accent, 0.55);
-		let selection = mix(bg, accent, 0.42);
-		let special = mix(accent_soft, text, 0.28);
-		let type_color = mix(accent, text, 0.38);
-		let ansi = [
-			rgb_to_color(bg),
-			rgb_to_color(accent_dim),
-			rgb_to_color(mix(accent, text, 0.10)),
-			rgb_to_color(accent),
-			rgb_to_color(accent_soft),
-			rgb_to_color(type_color),
-			rgb_to_color(mix(text, accent, 0.12)),
-			rgb_to_color(text),
-			rgb_to_color(panel_alt),
-			rgb_to_color(mix(accent_dim, text, 0.25)),
-			rgb_to_color(mix(accent, text, 0.25)),
-			rgb_to_color(mix(accent_soft, text, 0.20)),
-			rgb_to_color(mix(accent, rgb(255, 255, 255), 0.36)),
-			rgb_to_color(mix(type_color, text, 0.22)),
-			rgb_to_color(mix(text, accent, 0.28)),
-			rgb_to_color(rgb(248, 250, 255)),
-		];
+fn ui_theme(accent_hex: &str) -> UiTheme {
+	let accent = color_to_rgb(parse_hex_color(accent_hex).unwrap_or(Color::Rgb(30, 144, 255)));
+	let bg = mix(rgb(3, 4, 8), accent, 0.10);
+	let panel = mix(rgb(7, 10, 18), accent, 0.16);
+	let panel_alt = mix(rgb(12, 16, 28), accent, 0.24);
+	let accent_soft = mix(accent, rgb(255, 255, 255), 0.24);
+	let accent_dim = mix(accent, bg, 0.38);
+	let text = mix(rgb(245, 247, 250), accent, 0.18);
+	let muted = mix(text, panel_alt, 0.44);
+	let border = mix(panel_alt, accent, 0.55);
+	let selection = mix(bg, accent, 0.42);
+	let special = mix(accent_soft, text, 0.28);
+	let type_color = mix(accent, text, 0.38);
+	let ansi = [
+		rgb_to_color(bg),
+		rgb_to_color(accent_dim),
+		rgb_to_color(mix(accent, text, 0.10)),
+		rgb_to_color(accent),
+		rgb_to_color(accent_soft),
+		rgb_to_color(type_color),
+		rgb_to_color(mix(text, accent, 0.12)),
+		rgb_to_color(text),
+		rgb_to_color(panel_alt),
+		rgb_to_color(mix(accent_dim, text, 0.25)),
+		rgb_to_color(mix(accent, text, 0.25)),
+		rgb_to_color(mix(accent_soft, text, 0.20)),
+		rgb_to_color(mix(accent, rgb(255, 255, 255), 0.36)),
+		rgb_to_color(mix(type_color, text, 0.22)),
+		rgb_to_color(mix(text, accent, 0.28)),
+		rgb_to_color(rgb(248, 250, 255)),
+	];
 
-		UiTheme {
-			accent: rgb_to_color(accent),
-			accent_soft: rgb_to_color(accent_soft),
-			accent_dim: rgb_to_color(accent_dim),
-			bg: rgb_to_color(bg),
-			panel: rgb_to_color(panel),
-			panel_alt: rgb_to_color(panel_alt),
-			text: rgb_to_color(text),
-			muted: rgb_to_color(muted),
-			border: rgb_to_color(border),
-			selection: rgb_to_color(selection),
-			special: rgb_to_color(special),
-			type_color: rgb_to_color(type_color),
-			ansi,
-		}
-	})
+	UiTheme {
+		accent: rgb_to_color(accent),
+		accent_soft: rgb_to_color(accent_soft),
+		accent_dim: rgb_to_color(accent_dim),
+		bg: rgb_to_color(bg),
+		panel: rgb_to_color(panel),
+		panel_alt: rgb_to_color(panel_alt),
+		text: rgb_to_color(text),
+		muted: rgb_to_color(muted),
+		border: rgb_to_color(border),
+		selection: rgb_to_color(selection),
+		special: rgb_to_color(special),
+		type_color: rgb_to_color(type_color),
+		ansi,
+	}
 }
 
 fn parse_hex_color(value: &str) -> Option<Color> {
@@ -2593,6 +3439,14 @@ fn parse_hex_color(value: &str) -> Option<Color> {
 	let b = u8::from_str_radix(&value[4..6], 16).ok()?;
 
 	Some(Color::Rgb(r, g, b))
+}
+
+fn normalize_hex_color(value: &str) -> Option<String> {
+	if value.len() != 7 || !value.starts_with('#') {
+		return None;
+	}
+
+	parse_hex_color(value).map(|color| format!("#{}", color_hex(color)))
 }
 
 #[derive(Clone, Copy)]
@@ -2661,6 +3515,18 @@ fn blend_rgba_to_rgb(pixel: [u8; 4], background: RgbColor) -> RgbColor {
 	)
 }
 
+fn load_editor_preview(path: PathBuf) -> io::Result<EditorPreview> {
+	if is_image_path(&path) {
+		ImagePreview::load(path).map(EditorPreview::Image)
+	} else {
+		DocumentPreview::load(path).map(EditorPreview::Document)
+	}
+}
+
+fn uses_editor_preview(path: &Path) -> bool {
+	is_image_path(path) || is_pdf_path(path) || is_notebook_path(path)
+}
+
 fn is_image_path(path: &Path) -> bool {
 	let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
 		return false;
@@ -2672,10 +3538,103 @@ fn is_image_path(path: &Path) -> bool {
 	)
 }
 
-fn build_nvim_theme_command(ui: UiTheme) -> String {
+fn is_pdf_path(path: &Path) -> bool {
+	path
+		.extension()
+		.and_then(|value| value.to_str())
+		.is_some_and(|value| value.eq_ignore_ascii_case("pdf"))
+}
+
+fn is_notebook_path(path: &Path) -> bool {
+	path
+		.extension()
+		.and_then(|value| value.to_str())
+		.is_some_and(|value| value.eq_ignore_ascii_case("ipynb"))
+}
+
+fn preview_lines_from_iter(lines: impl IntoIterator<Item = String>) -> (Vec<Line<'static>>, bool) {
+	let mut preview = Vec::new();
+	let mut truncated = false;
+
+	for line in lines {
+		if preview.len() >= DOCUMENT_PREVIEW_MAX_LINES {
+			truncated = true;
+			break;
+		}
+		preview.push(Line::from(line));
+	}
+
+	if preview.is_empty() {
+		preview.push(Line::from("no preview available"));
+	}
+
+	(preview, truncated)
+}
+
+fn notebook_lines(source: Option<&serde_json::Value>) -> Vec<String> {
+	match source {
+		Some(serde_json::Value::String(text)) => text.lines().map(str::to_string).collect(),
+		Some(serde_json::Value::Array(lines)) => lines
+			.iter()
+			.filter_map(serde_json::Value::as_str)
+			.flat_map(|line| line.lines().map(str::to_string).collect::<Vec<_>>())
+			.collect(),
+		_ => Vec::new(),
+	}
+}
+
+fn notebook_output_lines(outputs: Option<&serde_json::Value>) -> Vec<String> {
+	let Some(outputs) = outputs.and_then(serde_json::Value::as_array) else {
+		return Vec::new();
+	};
+
+	let mut lines = Vec::new();
+	for output in outputs {
+		match output.get("output_type").and_then(serde_json::Value::as_str) {
+			Some("stream") => {
+				let name = output
+					.get("name")
+					.and_then(serde_json::Value::as_str)
+					.unwrap_or("stream");
+				for line in notebook_lines(output.get("text")) {
+					lines.push(format!("> {name}: {line}"));
+				}
+			}
+			Some("execute_result") | Some("display_data") => {
+				if let Some(data) = output.get("data") {
+					for line in notebook_text_plain_lines(data.get("text/plain")) {
+						lines.push(format!("> {line}"));
+					}
+				}
+			}
+			Some("error") => {
+				for line in notebook_lines(output.get("traceback")) {
+					lines.push(format!("! {line}"));
+				}
+			}
+			_ => {}
+		}
+	}
+
+	lines
+}
+
+fn notebook_text_plain_lines(value: Option<&serde_json::Value>) -> Vec<String> {
+	match value {
+		Some(serde_json::Value::String(text)) => text.lines().map(str::to_string).collect(),
+		Some(serde_json::Value::Array(lines)) => lines
+			.iter()
+			.filter_map(serde_json::Value::as_str)
+			.map(str::to_string)
+			.collect(),
+		_ => Vec::new(),
+	}
+}
+
+fn nvim_theme_lua(ui: UiTheme) -> String {
 	let ansi = ui.ansi.map(color_hex);
 	format!(
-		"+lua local p={{bg='{bg}',panel='{panel}',panel_alt='{panel_alt}',text='{text}',muted='{muted}',accent='{accent}',accent_soft='{accent_soft}',accent_dim='{accent_dim}',special='{special}',type_='{type_color}',select='{selection}'}} local set=vim.api.nvim_set_hl set(0,'Normal',{{fg=p.text,bg=p.panel}}) set(0,'NormalNC',{{fg=p.text,bg=p.panel}}) set(0,'NormalFloat',{{fg=p.text,bg=p.panel_alt}}) set(0,'FloatBorder',{{fg=p.accent_dim,bg=p.panel_alt}}) set(0,'SignColumn',{{bg=p.panel}}) set(0,'EndOfBuffer',{{fg=p.panel,bg=p.panel}}) set(0,'LineNr',{{fg=p.muted,bg=p.panel}}) set(0,'CursorLineNr',{{fg=p.accent,bg=p.panel,bold=true}}) set(0,'CursorLine',{{bg=p.bg}}) set(0,'CursorColumn',{{bg=p.bg}}) set(0,'ColorColumn',{{bg=p.bg}}) set(0,'Visual',{{bg=p.select}}) set(0,'Search',{{fg=p.bg,bg=p.accent}}) set(0,'IncSearch',{{fg=p.bg,bg=p.accent_soft,bold=true}}) set(0,'MatchParen',{{fg=p.accent_soft,bg=p.bg,bold=true}}) set(0,'StatusLine',{{fg=p.bg,bg=p.accent,bold=true}}) set(0,'StatusLineNC',{{fg=p.text,bg=p.panel_alt}}) set(0,'VertSplit',{{fg=p.accent_dim,bg=p.panel}}) set(0,'WinSeparator',{{fg=p.accent_dim,bg=p.panel}}) set(0,'Pmenu',{{fg=p.text,bg=p.panel_alt}}) set(0,'PmenuSel',{{fg=p.bg,bg=p.accent}}) set(0,'Comment',{{fg=p.muted,italic=true}}) set(0,'Constant',{{fg=p.accent_soft}}) set(0,'String',{{fg=p.type_}}) set(0,'Character',{{fg=p.type_}}) set(0,'Number',{{fg=p.special}}) set(0,'Boolean',{{fg=p.special,bold=true}}) set(0,'Float',{{fg=p.special}}) set(0,'Identifier',{{fg=p.text}}) set(0,'Function',{{fg=p.accent_soft,bold=true}}) set(0,'Statement',{{fg=p.accent,bold=true}}) set(0,'Conditional',{{fg=p.accent,bold=true}}) set(0,'Repeat',{{fg=p.accent,bold=true}}) set(0,'Label',{{fg=p.accent}}) set(0,'Operator',{{fg=p.text}}) set(0,'Keyword',{{fg=p.accent,bold=true}}) set(0,'Exception',{{fg=p.special,bold=true}}) set(0,'PreProc',{{fg=p.type_}}) set(0,'Include',{{fg=p.type_}}) set(0,'Define',{{fg=p.type_}}) set(0,'Macro',{{fg=p.type_}}) set(0,'PreCondit',{{fg=p.type_}}) set(0,'Type',{{fg=p.type_,bold=true}}) set(0,'StorageClass',{{fg=p.type_}}) set(0,'Structure',{{fg=p.type_}}) set(0,'Typedef',{{fg=p.type_}}) set(0,'Special',{{fg=p.special}}) set(0,'SpecialChar',{{fg=p.special}}) set(0,'Delimiter',{{fg=p.accent_dim}}) set(0,'SpecialComment',{{fg=p.muted}}) set(0,'Todo',{{fg=p.bg,bg=p.accent_soft,bold=true}}) vim.g.terminal_color_0='{c0}' vim.g.terminal_color_1='{c1}' vim.g.terminal_color_2='{c2}' vim.g.terminal_color_3='{c3}' vim.g.terminal_color_4='{c4}' vim.g.terminal_color_5='{c5}' vim.g.terminal_color_6='{c6}' vim.g.terminal_color_7='{c7}' vim.g.terminal_color_8='{c8}' vim.g.terminal_color_9='{c9}' vim.g.terminal_color_10='{c10}' vim.g.terminal_color_11='{c11}' vim.g.terminal_color_12='{c12}' vim.g.terminal_color_13='{c13}' vim.g.terminal_color_14='{c14}' vim.g.terminal_color_15='{c15}'",
+		"local p={{bg='{bg}',panel='{panel}',panel_alt='{panel_alt}',text='{text}',muted='{muted}',accent='{accent}',accent_soft='{accent_soft}',accent_dim='{accent_dim}',special='{special}',type_='{type_color}',select='{selection}'}} local set=vim.api.nvim_set_hl set(0,'Normal',{{fg=p.text,bg=p.panel}}) set(0,'NormalNC',{{fg=p.text,bg=p.panel}}) set(0,'NormalFloat',{{fg=p.text,bg=p.panel_alt}}) set(0,'FloatBorder',{{fg=p.accent_dim,bg=p.panel_alt}}) set(0,'SignColumn',{{bg=p.panel}}) set(0,'EndOfBuffer',{{fg=p.panel,bg=p.panel}}) set(0,'LineNr',{{fg=p.muted,bg=p.panel}}) set(0,'CursorLineNr',{{fg=p.accent,bg=p.panel,bold=true}}) set(0,'CursorLine',{{bg=p.bg}}) set(0,'CursorColumn',{{bg=p.bg}}) set(0,'ColorColumn',{{bg=p.bg}}) set(0,'Visual',{{bg=p.select}}) set(0,'Search',{{fg=p.bg,bg=p.accent}}) set(0,'IncSearch',{{fg=p.bg,bg=p.accent_soft,bold=true}}) set(0,'MatchParen',{{fg=p.accent_soft,bg=p.bg,bold=true}}) set(0,'StatusLine',{{fg=p.bg,bg=p.accent,bold=true}}) set(0,'StatusLineNC',{{fg=p.text,bg=p.panel_alt}}) set(0,'VertSplit',{{fg=p.accent_dim,bg=p.panel}}) set(0,'WinSeparator',{{fg=p.accent_dim,bg=p.panel}}) set(0,'Pmenu',{{fg=p.text,bg=p.panel_alt}}) set(0,'PmenuSel',{{fg=p.bg,bg=p.accent}}) set(0,'Comment',{{fg=p.muted,italic=true}}) set(0,'Constant',{{fg=p.accent_soft}}) set(0,'String',{{fg=p.type_}}) set(0,'Character',{{fg=p.type_}}) set(0,'Number',{{fg=p.special}}) set(0,'Boolean',{{fg=p.special,bold=true}}) set(0,'Float',{{fg=p.special}}) set(0,'Identifier',{{fg=p.text}}) set(0,'Function',{{fg=p.accent_soft,bold=true}}) set(0,'Statement',{{fg=p.accent,bold=true}}) set(0,'Conditional',{{fg=p.accent,bold=true}}) set(0,'Repeat',{{fg=p.accent,bold=true}}) set(0,'Label',{{fg=p.accent}}) set(0,'Operator',{{fg=p.text}}) set(0,'Keyword',{{fg=p.accent,bold=true}}) set(0,'Exception',{{fg=p.special,bold=true}}) set(0,'PreProc',{{fg=p.type_}}) set(0,'Include',{{fg=p.type_}}) set(0,'Define',{{fg=p.type_}}) set(0,'Macro',{{fg=p.type_}}) set(0,'PreCondit',{{fg=p.type_}}) set(0,'Type',{{fg=p.type_,bold=true}}) set(0,'StorageClass',{{fg=p.type_}}) set(0,'Structure',{{fg=p.type_}}) set(0,'Typedef',{{fg=p.type_}}) set(0,'Special',{{fg=p.special}}) set(0,'SpecialChar',{{fg=p.special}}) set(0,'Delimiter',{{fg=p.accent_dim}}) set(0,'SpecialComment',{{fg=p.muted}}) set(0,'Todo',{{fg=p.bg,bg=p.accent_soft,bold=true}}) vim.g.terminal_color_0='{c0}' vim.g.terminal_color_1='{c1}' vim.g.terminal_color_2='{c2}' vim.g.terminal_color_3='{c3}' vim.g.terminal_color_4='{c4}' vim.g.terminal_color_5='{c5}' vim.g.terminal_color_6='{c6}' vim.g.terminal_color_7='{c7}' vim.g.terminal_color_8='{c8}' vim.g.terminal_color_9='{c9}' vim.g.terminal_color_10='{c10}' vim.g.terminal_color_11='{c11}' vim.g.terminal_color_12='{c12}' vim.g.terminal_color_13='{c13}' vim.g.terminal_color_14='{c14}' vim.g.terminal_color_15='{c15}'",
 		bg = color_hex(ui.bg),
 		panel = color_hex(ui.panel),
 		panel_alt = color_hex(ui.panel_alt),
@@ -2704,6 +3663,10 @@ fn build_nvim_theme_command(ui: UiTheme) -> String {
 		c14 = ansi[14],
 		c15 = ansi[15],
 	)
+}
+
+fn build_nvim_theme_command(ui: UiTheme) -> String {
+	format!("+lua {}", nvim_theme_lua(ui))
 }
 
 fn io_error(error: impl std::fmt::Display) -> io::Error {
