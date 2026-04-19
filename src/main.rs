@@ -276,6 +276,7 @@ struct SessionState {
 	root: PathBuf,
 	open_files: Vec<PathBuf>,
 	active_file: Option<PathBuf>,
+	accent_hex: Option<String>,
 }
 
 struct NvimBufferState {
@@ -286,6 +287,11 @@ struct NvimBufferState {
 impl App {
 	fn new(requested_path: Option<PathBuf>) -> io::Result<Self> {
 		let saved_session = load_saved_session();
+		let accent_hex = saved_session
+			.as_ref()
+			.and_then(|session| session.accent_hex.as_deref())
+			.and_then(normalize_hex_color)
+			.unwrap_or_else(|| ACCENT_COLOR.to_string());
 		let cwd = env::current_dir()?;
 		let (root, saved_session, requested_path) = if let Some(requested_path) = requested_path {
 			let requested_path = absolutize_path(&cwd, &requested_path);
@@ -310,7 +316,7 @@ impl App {
 				.unwrap_or(cwd);
 			(root, saved_session, None)
 		};
-		let ui = ui_theme(ACCENT_COLOR);
+		let ui = ui_theme(&accent_hex);
 		let restored_files = saved_session
 			.as_ref()
 			.map(|session| sanitize_session_files(&root, &session.open_files))
@@ -911,6 +917,7 @@ impl App {
 				if !self.nvim.is_exited() {
 					self.nvim.apply_theme(self.ui)?;
 				}
+				let _ = self.persist_session_state(false);
 				self.command_prompt = None;
 				self.status_message = format!("accent set to {hex}");
 				Ok(())
@@ -1202,6 +1209,7 @@ impl App {
 			root: self.project_tree.root.clone(),
 			open_files,
 			active_file,
+			accent_hex: Some(color_hex(self.ui.accent)),
 		})
 	}
 
@@ -2929,11 +2937,16 @@ fn load_saved_session() -> Option<SessionState> {
 		.get("active_file")
 		.and_then(serde_json::Value::as_str)
 		.map(PathBuf::from);
+	let accent_hex = value
+		.get("accent_hex")
+		.and_then(serde_json::Value::as_str)
+		.map(str::to_string);
 
 	Some(SessionState {
 		root,
 		open_files,
 		active_file,
+		accent_hex,
 	})
 }
 
@@ -2949,6 +2962,7 @@ fn save_saved_session(session: &SessionState) -> io::Result<()> {
 		"root": session.root.display().to_string(),
 		"open_files": session.open_files.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
 		"active_file": session.active_file.as_ref().map(|path| path.display().to_string()),
+		"accent_hex": session.accent_hex,
 	});
 	let contents = serde_json::to_string_pretty(&payload).map_err(io_error)?;
 	fs::write(path, contents)
