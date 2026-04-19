@@ -49,7 +49,6 @@ fn run_app(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
 enum Focus {
 	Editor,
 	Terminal,
-	Performance,
 	ProjectTree,
 	Codex,
 }
@@ -176,7 +175,7 @@ impl App {
 			Focus::Editor => self.forward_key_to_pane(key, true),
 			Focus::Terminal => self.forward_key_to_pane(key, false),
 			Focus::ProjectTree => self.handle_project_tree_key(key),
-			Focus::Performance | Focus::Codex => {
+			Focus::Codex => {
 				if key.code == KeyCode::Esc {
 					AppAction::Quit
 				} else {
@@ -218,7 +217,7 @@ impl App {
 						self.status_message = "toggled directory".to_string();
 					}
 					Some(TreeAction::OpenFile(path)) => {
-						if let Err(error) = self.nvim.open_file(&path) {
+						if let Err(error) = self.open_file_in_editor(path.clone()) {
 							self.status_message = format!("open failed: {error}");
 						} else {
 							self.focus = Focus::Editor;
@@ -232,6 +231,15 @@ impl App {
 			_ => AppAction::Continue,
 		}
 	}
+
+	fn open_file_in_editor(&mut self, path: PathBuf) -> io::Result<()> {
+		if self.nvim.is_exited() {
+			self.nvim = PtyPane::spawn_nvim(path)?;
+			return Ok(());
+		}
+
+		self.nvim.open_file(&path)
+	}
 }
 
 impl Focus {
@@ -239,7 +247,6 @@ impl Focus {
 		match self {
 			Focus::Editor => "editor",
 			Focus::Terminal => "terminal",
-			Focus::Performance => "performance",
 			Focus::ProjectTree => "project tree",
 			Focus::Codex => "codex",
 		}
@@ -248,8 +255,7 @@ impl Focus {
 	fn next(self) -> Self {
 		match self {
 			Focus::Editor => Focus::Terminal,
-			Focus::Terminal => Focus::Performance,
-			Focus::Performance => Focus::ProjectTree,
+			Focus::Terminal => Focus::ProjectTree,
 			Focus::ProjectTree => Focus::Codex,
 			Focus::Codex => Focus::Editor,
 		}
@@ -262,10 +268,18 @@ impl PtyPane {
 		cmd.arg("--clean");
 		cmd.arg("-n");
 		cmd.arg(file_path.as_os_str());
+		cmd.arg("+set hidden");
 		cmd.arg("+set mouse=");
 		cmd.arg("+set list");
 		cmd.arg("+set listchars=tab:>-,space:.,trail:~");
 		cmd.arg("+syntax on");
+		cmd.arg(
+			"+lua function _G.veditor_close_buffer() local current = vim.api.nvim_get_current_buf(); local listed = vim.fn.getbufinfo({buflisted = 1}); if vim.bo.modified then vim.cmd('write') end; if #listed > 1 then vim.cmd('bnext') else vim.cmd('enew') end; if vim.api.nvim_buf_is_valid(current) then vim.cmd('bdelete ' .. current) end end",
+		);
+		cmd.arg("+command! VeditorClose lua _G.veditor_close_buffer()");
+		cmd.arg(
+			"+cnoreabbrev <expr> x getcmdtype() == ':' && getcmdline() ==# 'x' ? 'VeditorClose' : 'x'",
+		);
 		cmd.cwd(env::current_dir()?);
 		cmd.env("TERM", "xterm-256color");
 		Self::spawn("nvim", cmd)
@@ -378,9 +392,13 @@ impl PtyPane {
 
 	fn open_file(&mut self, path: &Path) -> io::Result<()> {
 		let escaped = escape_nvim_path(path);
-		let command = format!("\x1b:edit {escaped}\r");
+		let command = format!("\x1b:drop {escaped}\r");
 		self.writer.write_all(command.as_bytes())?;
 		self.writer.flush()
+	}
+
+	fn is_exited(&mut self) -> bool {
+		self.poll_exit().is_some()
 	}
 
 	fn snapshot(&self, ui: UiTheme) -> PtySnapshot {
@@ -687,21 +705,22 @@ fn project_tree(frame: &mut Frame, area: Rect, app: &App) {
 		.iter()
 		.enumerate()
 		.map(|(index, entry)| {
-			let relative = entry
+			let label = entry
 				.path
-				.strip_prefix(&app.project_tree.root)
-				.unwrap_or(&entry.path)
-				.display()
+				.file_name()
+				.and_then(|name| name.to_str())
+				.unwrap_or_else(|| entry.path.to_str().unwrap_or_default())
 				.to_string();
 			let indent = "  ".repeat(entry.depth);
-			let symbol = if entry.is_dir {
-				if app.project_tree.expanded.contains(&entry.path) {
+			let line = if entry.is_dir {
+				let symbol = if app.project_tree.expanded.contains(&entry.path) {
 					"▾"
 				} else {
 					"▸"
-				}
+				};
+				format!("{indent}{symbol} {label}")
 			} else {
-				"•"
+				format!("{indent}{label}")
 			};
 
 			let style = if index == app.project_tree.selected {
@@ -715,10 +734,7 @@ fn project_tree(frame: &mut Frame, area: Rect, app: &App) {
 				Style::default().fg(app.ui.text)
 			};
 
-			ListItem::new(Line::from(Span::styled(
-				format!("{indent}{symbol} {relative}"),
-				style,
-			)))
+			ListItem::new(Line::from(Span::styled(line, style)))
 		})
 		.collect::<Vec<_>>();
 
@@ -738,7 +754,7 @@ fn performance_block(frame: &mut Frame, area: Rect, app: &App) {
 		.areas(area);
 
 	let gauge_style = Style::default().fg(app.ui.accent).bg(app.ui.panel_alt);
-	let focus = app.focus == Focus::Performance;
+	let focus = false;
 
 	frame.render_widget(
 		Gauge::default()
