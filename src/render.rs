@@ -68,9 +68,7 @@ fn render_editor(frame: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn render_pty_pane(frame: &mut Frame, area: Rect, ui: UiTheme, focused: bool, pane: &mut PtyPane) {
-    let block = panel(pane.title, ui, focused);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = render_panel(frame, area, pane.title, ui, focused, ui.panel);
 
     if inner.width == 0 || inner.height == 0 {
         return;
@@ -107,9 +105,7 @@ fn render_image_preview(
             .and_then(|name| name.to_str())
             .unwrap_or("preview")
     );
-    let block = panel(&title, ui, focused);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = render_panel(frame, area, &title, ui, focused, ui.panel);
 
     if inner.width == 0 || inner.height == 0 {
         return;
@@ -159,9 +155,7 @@ fn render_document_preview(
             .and_then(|name| name.to_str())
             .unwrap_or("preview")
     );
-    let block = panel(&title, ui, focused);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = render_panel(frame, area, &title, ui, focused, ui.panel);
 
     if inner.width == 0 || inner.height == 0 {
         return;
@@ -205,9 +199,14 @@ fn project_tree(frame: &mut Frame, area: Rect, app: &App) {
         "project tree".to_string()
     };
 
-    let block = panel(&title, app.ui, app.focus == Focus::ProjectTree);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = render_panel(
+        frame,
+        area,
+        &title,
+        app.ui,
+        app.focus == Focus::ProjectTree,
+        app.ui.panel,
+    );
 
     if inner.width == 0 || inner.height == 0 {
         return;
@@ -242,8 +241,8 @@ fn project_tree(frame: &mut Frame, area: Rect, app: &App) {
         let list = List::new(items)
             .highlight_style(
                 Style::default()
-                    .fg(app.ui.bg)
-                    .bg(app.ui.accent)
+                    .fg(list_selection_fg(app.ui))
+                    .bg(list_selection_bg(app.ui))
                     .add_modifier(Modifier::BOLD),
             )
             .highlight_symbol(" ");
@@ -270,8 +269,8 @@ fn project_tree(frame: &mut Frame, area: Rect, app: &App) {
                 let is_startup = entry.path == app.project_tree.root.join(STARTUP_FILE);
                 let row_style = if is_selected {
                     Style::default()
-                        .fg(app.ui.bg)
-                        .bg(app.ui.accent)
+                        .fg(list_selection_fg(app.ui))
+                        .bg(list_selection_bg(app.ui))
                         .add_modifier(Modifier::BOLD)
                 } else if is_startup {
                     Style::default()
@@ -310,8 +309,8 @@ fn project_tree(frame: &mut Frame, area: Rect, app: &App) {
         let tree = List::new(items)
             .highlight_style(
                 Style::default()
-                    .fg(app.ui.bg)
-                    .bg(app.ui.accent)
+                    .fg(list_selection_fg(app.ui))
+                    .bg(list_selection_bg(app.ui))
                     .add_modifier(Modifier::BOLD),
             )
             .highlight_symbol(" ");
@@ -364,15 +363,7 @@ fn render_project_tree_footer(frame: &mut Frame, area: Rect, app: &App) {
     };
 
     if let (Some(output), Some(output_area)) = (&app.command_output, output_area) {
-        let block = Block::bordered()
-            .border_style(Style::default().fg(app.ui.border))
-            .style(Style::default().bg(app.ui.panel_alt))
-            .title(Line::styled(
-                format!(" {} ", output.title),
-                Style::default()
-                    .fg(app.ui.accent)
-                    .add_modifier(Modifier::BOLD),
-            ));
+        let block = framed_block(&output.title, app.ui, false, app.ui.panel_alt);
         let widget = Paragraph::new(output.lines.iter().take(6).cloned().collect::<Vec<_>>())
             .block(block)
             .wrap(Wrap { trim: false });
@@ -380,15 +371,12 @@ fn render_project_tree_footer(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     if let (Some(command), Some(prompt_area)) = (&app.command_prompt, prompt_area) {
-        let command_block = Block::bordered()
-            .border_style(Style::default().fg(app.ui.border))
-            .style(Style::default().bg(app.ui.panel_alt))
-            .title(Line::styled(
-                " command  enter run  esc cancel ",
-                Style::default()
-                    .fg(app.ui.accent)
-                    .add_modifier(Modifier::BOLD),
-            ));
+        let command_block = framed_block(
+            "command  enter run  esc cancel",
+            app.ui,
+            true,
+            app.ui.panel_alt,
+        );
         let command_inner = command_block.inner(prompt_area);
         let command_widget = Paragraph::new(Line::from(vec![
             Span::styled(
@@ -433,7 +421,17 @@ fn performance_block(frame: &mut Frame, area: Rect, app: &App) {
         ])
         .areas(area);
 
-    let gauge_style = Style::default().fg(app.ui.accent).bg(app.ui.panel_alt);
+    let gauge_style = Style::default()
+        .fg(if is_glow_mood(app.ui) {
+            app.ui.glow_hot
+        } else {
+            app.ui.accent
+        })
+        .bg(if is_glow_mood(app.ui) {
+            app.ui.glow_fill
+        } else {
+            app.ui.panel_alt
+        });
     let focus = false;
     let metrics = &app.terminal_metrics;
     let gpu_percent = metrics.gpu_percent.unwrap_or(0.0).clamp(0.0, 100.0) as u16;
@@ -442,7 +440,12 @@ fn performance_block(frame: &mut Frame, area: Rect, app: &App) {
 
     frame.render_widget(
         Gauge::default()
-            .block(panel("gpu / terminal", app.ui, focus))
+            .block(framed_block(
+                "gpu / terminal",
+                app.ui,
+                focus,
+                app.ui.panel_alt,
+            ))
             .gauge_style(gauge_style)
             .label(
                 metrics
@@ -455,7 +458,12 @@ fn performance_block(frame: &mut Frame, area: Rect, app: &App) {
     );
     frame.render_widget(
         Gauge::default()
-            .block(panel("cpu / terminal", app.ui, false))
+            .block(framed_block(
+                "cpu / terminal",
+                app.ui,
+                false,
+                app.ui.panel_alt,
+            ))
             .gauge_style(gauge_style)
             .label(format!(
                 "{:.1}% {}",
@@ -466,7 +474,12 @@ fn performance_block(frame: &mut Frame, area: Rect, app: &App) {
     );
     frame.render_widget(
         Gauge::default()
-            .block(panel("mem / terminal", app.ui, false))
+            .block(framed_block(
+                "mem / terminal",
+                app.ui,
+                false,
+                app.ui.panel_alt,
+            ))
             .gauge_style(gauge_style)
             .label(metrics.memory_label())
             .percent(mem_percent),
@@ -489,14 +502,28 @@ fn performance_block(frame: &mut Frame, area: Rect, app: &App) {
         ),
         Line::styled(metrics.note.clone(), Style::default().fg(app.ui.muted)),
     ])
-    .block(panel("terminal job", app.ui, false))
+    .block(framed_block(
+        "terminal job",
+        app.ui,
+        false,
+        app.ui.panel_alt,
+    ))
     .wrap(Wrap { trim: true });
     frame.render_widget(detail, status_area);
 
     let spark = Sparkline::default()
-        .block(panel("cpu / history", app.ui, false))
+        .block(framed_block(
+            "cpu / history",
+            app.ui,
+            false,
+            app.ui.panel_alt,
+        ))
         .data(&metrics.cpu_history)
-        .style(Style::default().fg(app.ui.accent))
+        .style(Style::default().fg(if is_glow_mood(app.ui) {
+            app.ui.glow_hot
+        } else {
+            app.ui.accent
+        }))
         .max(
             metrics
                 .cpu_history
@@ -511,9 +538,14 @@ fn performance_block(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn codex_block(frame: &mut Frame, area: Rect, app: &mut App) {
-    let block = panel("codex", app.ui, app.focus == Focus::Codex);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = render_panel(
+        frame,
+        area,
+        "codex",
+        app.ui,
+        app.focus == Focus::Codex,
+        app.ui.panel,
+    );
     app.codex_history_area = None;
     app.codex_change_list_area = None;
 
@@ -604,15 +636,7 @@ fn codex_block(frame: &mut Frame, area: Rect, app: &mut App) {
         ]
     };
 
-    let input_block = Block::bordered()
-        .border_style(Style::default().fg(app.ui.border))
-        .style(Style::default().bg(app.ui.panel_alt))
-        .title(Line::styled(
-            " chat ",
-            Style::default()
-                .fg(app.ui.accent)
-                .add_modifier(Modifier::BOLD),
-        ));
+    let input_block = framed_block("chat", app.ui, true, app.ui.panel_alt);
     let input_inner = input_block.inner(input_area);
     let input = Paragraph::new(input_lines)
         .block(input_block)
@@ -1077,15 +1101,7 @@ fn render_codex_change_block(
     app: &App,
     change_set: &CodexChangeSet,
 ) -> Option<Rect> {
-    let block = Block::bordered()
-        .border_style(Style::default().fg(app.ui.border))
-        .style(Style::default().bg(app.ui.panel_alt))
-        .title(Line::styled(
-            " changes ",
-            Style::default()
-                .fg(app.ui.accent)
-                .add_modifier(Modifier::BOLD),
-        ));
+    let block = framed_block("changes", app.ui, false, app.ui.panel_alt);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1163,7 +1179,13 @@ fn codex_change_header_line(summary: &str, action: &str, width: u16, ui: UiTheme
         Span::raw(" ".repeat(spacing)),
         Span::styled(
             action.to_string(),
-            Style::default().fg(ui.accent).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(if is_glow_mood(ui) {
+                    ui.glow_hot
+                } else {
+                    ui.accent
+                })
+                .add_modifier(Modifier::BOLD),
         ),
     ])
 }
@@ -1221,24 +1243,98 @@ fn codex_changed_file_line(app: &App, file: &CodexChangedFile, width: u16) -> Li
     Line::from(spans)
 }
 
-fn panel<'a>(title: &'a str, ui: UiTheme, focused: bool) -> Block<'a> {
+fn render_panel(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    ui: UiTheme,
+    focused: bool,
+    fill: Color,
+) -> Rect {
+    let block = framed_block(title, ui, focused, fill);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if !is_glow_mood(ui) || inner.width < 3 || inner.height < 3 {
+        return inner;
+    }
+
+    let top = Rect::new(inner.x, inner.y, inner.width, 1);
+    let bottom = Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1);
+    let left = Rect::new(inner.x, inner.y, 1, inner.height);
+    let right = Rect::new(inner.right().saturating_sub(1), inner.y, 1, inner.height);
+    let spill = Block::default().style(Style::default().bg(ui.glow_fill));
+    let edge = Block::default().style(Style::default().bg(ui.glow_outer));
+    frame.render_widget(&spill, top);
+    frame.render_widget(&spill, bottom);
+    frame.render_widget(&edge, left);
+    frame.render_widget(&edge, right);
+
+    inset_rect(inner, 1)
+}
+
+fn framed_block<'a>(title: &'a str, ui: UiTheme, focused: bool, fill: Color) -> Block<'a> {
     let border_style = if focused {
-        Style::default().fg(ui.accent).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(if is_glow_mood(ui) {
+                ui.glow_hot
+            } else {
+                ui.accent
+            })
+            .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(ui.border)
+        Style::default().fg(if is_glow_mood(ui) {
+            ui.glow_inner
+        } else {
+            ui.border
+        })
+    };
+    let title_style = if is_glow_mood(ui) {
+        Style::default()
+            .fg(ui.bg)
+            .bg(if focused { ui.glow_hot } else { ui.glow_inner })
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(ui.accent).add_modifier(Modifier::BOLD)
     };
 
     Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(border_style)
-        .style(Style::default().bg(ui.panel))
-        .title(
-            Line::from(vec![Span::styled(
-                format!(" {} ", title),
-                Style::default().fg(ui.accent).add_modifier(Modifier::BOLD),
-            )])
-            .left_aligned(),
-        )
+        .style(Style::default().bg(fill))
+        .title(Line::from(vec![Span::styled(
+            format!(" {} ", title),
+            title_style,
+        )]))
+}
+
+fn inset_rect(area: Rect, inset: u16) -> Rect {
+    if area.width <= inset.saturating_mul(2) || area.height <= inset.saturating_mul(2) {
+        return area;
+    }
+
+    Rect::new(
+        area.x.saturating_add(inset),
+        area.y.saturating_add(inset),
+        area.width.saturating_sub(inset.saturating_mul(2)),
+        area.height.saturating_sub(inset.saturating_mul(2)),
+    )
+}
+
+fn is_glow_mood(ui: UiTheme) -> bool {
+    matches!(ui.mood, ThemeMood::Synthwave84)
+}
+
+fn list_selection_bg(ui: UiTheme) -> Color {
+    if is_glow_mood(ui) {
+        ui.glow_hot
+    } else {
+        ui.accent
+    }
+}
+
+fn list_selection_fg(ui: UiTheme) -> Color {
+    if is_glow_mood(ui) { ui.bg } else { ui.bg }
 }
 
 fn truncate_with_ellipsis(text: &str, max_chars: usize) -> String {

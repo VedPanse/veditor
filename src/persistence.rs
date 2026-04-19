@@ -2,7 +2,10 @@
 
 use std::{collections::BTreeMap, env, fs, io, path::PathBuf};
 
-use crate::{GlobalSettings, NvimBufferState, SessionState, io_error, theme::normalize_hex_color};
+use crate::{
+    GlobalSettings, NvimBufferState, SessionState, io_error,
+    theme::{normalize_hex_color, normalize_theme_mood, theme_mood_name},
+};
 
 /// Loads the last saved workspace session from disk.
 pub(crate) fn load_saved_session() -> Option<SessionState> {
@@ -34,6 +37,11 @@ pub(crate) fn load_saved_session() -> Option<SessionState> {
         .get("accent_hex")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
+    let mood = value
+        .get("mood")
+        .and_then(serde_json::Value::as_str)
+        .and_then(normalize_theme_mood)
+        .map(|mood| theme_mood_name(mood).to_string());
     let accent_registry = value
         .get("accent_registry")
         .and_then(serde_json::Value::as_object)
@@ -55,6 +63,7 @@ pub(crate) fn load_saved_session() -> Option<SessionState> {
         open_files,
         active_file,
         accent_hex,
+        mood,
         accent_registry,
     })
 }
@@ -73,6 +82,7 @@ pub(crate) fn save_saved_session(session: &SessionState) -> io::Result<()> {
         "open_files": session.open_files.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
         "active_file": session.active_file.as_ref().map(|path| path.display().to_string()),
         "accent_hex": session.accent_hex,
+        "mood": session.mood,
         "accent_registry": session.accent_registry,
     });
     let contents = serde_json::to_string_pretty(&payload).map_err(io_error)?;
@@ -88,6 +98,11 @@ pub(crate) fn load_global_settings() -> Option<GlobalSettings> {
         .get("accent_hex")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
+    let mood = value
+        .get("mood")
+        .and_then(serde_json::Value::as_str)
+        .and_then(normalize_theme_mood)
+        .map(|mood| theme_mood_name(mood).to_string());
     let accent_registry = value
         .get("accent_registry")
         .and_then(serde_json::Value::as_object)
@@ -106,6 +121,7 @@ pub(crate) fn load_global_settings() -> Option<GlobalSettings> {
 
     Some(GlobalSettings {
         accent_hex,
+        mood,
         accent_registry,
     })
 }
@@ -135,6 +151,7 @@ pub(crate) fn save_global_settings(settings: &GlobalSettings) -> io::Result<()> 
 
     let payload = serde_json::json!({
         "accent_hex": settings.accent_hex,
+        "mood": settings.mood,
         "accent_registry": accent_registry,
     });
     let contents = serde_json::to_string_pretty(&payload).map_err(io_error)?;

@@ -386,7 +386,7 @@ fn vt_color_to_ratatui(color: VtColor, default: Color) -> Color {
 }
 
 fn ansi_index_to_color(idx: u8) -> Color {
-    let ui = ui_theme(ACCENT_COLOR);
+    let ui = ui_theme(ACCENT_COLOR, ThemeMood::Default);
     match idx {
         0..=15 => ui.ansi[idx as usize],
         16..=231 => {

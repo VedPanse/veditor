@@ -18,6 +18,17 @@ impl App {
                     .and_then(normalize_hex_color)
             })
             .unwrap_or_else(|| ACCENT_COLOR.to_string());
+        let saved_mood = global_settings
+            .as_ref()
+            .and_then(|settings| settings.mood.as_deref())
+            .and_then(normalize_theme_mood)
+            .or_else(|| {
+                saved_session
+                    .as_ref()
+                    .and_then(|session| session.mood.as_deref())
+                    .and_then(normalize_theme_mood)
+            })
+            .unwrap_or(ThemeMood::Default);
         let saved_accent_registry = global_settings
             .as_ref()
             .map(|settings| settings.accent_registry.clone())
@@ -49,7 +60,7 @@ impl App {
                 .unwrap_or(cwd);
             (root, saved_session, None)
         };
-        let ui = ui_theme(&saved_accent_hex);
+        let ui = ui_theme(&saved_accent_hex, saved_mood);
         let accent_registry = saved_accent_registry;
         let restored_files = saved_session
             .as_ref()
@@ -75,6 +86,8 @@ impl App {
             terminal_metrics: TerminalMetrics::new(None),
             focus: Focus::Editor,
             status_message: "embedded nvim + terminal ready".to_string(),
+            accent_hex: saved_accent_hex,
+            mood: saved_mood,
             ui,
             accent_registry,
             command_output: None,
@@ -765,6 +778,23 @@ impl App {
         let trimmed = command.trim().to_string();
         let parts = trimmed.split_whitespace().collect::<Vec<_>>();
         match parts.as_slice() {
+            [":set", "mood"] => {
+                self.apply_mood_command(ThemeMood::Synthwave84)?;
+                self.command_prompt = None;
+                self.command_output = Some(self.build_mood_output());
+                self.status_message = "mood set to synthwave84".to_string();
+                Ok(())
+            }
+            [":set", "mood", value] => {
+                let mood = normalize_theme_mood(value).ok_or_else(|| {
+                    io_error("usage: :set mood | :set mood synthwave84 | :set mood default")
+                })?;
+                self.apply_mood_command(mood)?;
+                self.command_prompt = None;
+                self.command_output = Some(self.build_mood_output());
+                self.status_message = format!("mood set to {}", theme_mood_name(mood));
+                Ok(())
+            }
             [":set", "accent", value] => {
                 let hex = self
                     .resolve_accent_value(value)
@@ -797,12 +827,29 @@ impl App {
                 self.status_message = "listed registered accent colors".to_string();
                 Ok(())
             }
+            [":get", "mood"] => {
+                self.command_output = Some(self.build_mood_output());
+                self.command_prompt = None;
+                self.status_message = format!("current mood {}", theme_mood_name(self.mood));
+                Ok(())
+            }
             _ => Err(io_error("unknown command")),
         }
     }
 
     fn apply_accent_command(&mut self, hex: &str) -> io::Result<()> {
-        self.ui = ui_theme(hex);
+        self.accent_hex = hex.to_string();
+        self.ui = ui_theme(&self.accent_hex, self.mood);
+        if !self.nvim.is_exited() {
+            self.nvim.apply_theme(self.ui)?;
+        }
+        let _ = self.persist_session_state(false);
+        Ok(())
+    }
+
+    fn apply_mood_command(&mut self, mood: ThemeMood) -> io::Result<()> {
+        self.mood = mood;
+        self.ui = ui_theme(&self.accent_hex, self.mood);
         if !self.nvim.is_exited() {
             self.nvim.apply_theme(self.ui)?;
         }
@@ -855,6 +902,41 @@ impl App {
         CommandOutput {
             title: "registered accents".to_string(),
             lines,
+        }
+    }
+
+    fn build_mood_output(&self) -> CommandOutput {
+        let badge = match self.mood {
+            ThemeMood::Default => "calm",
+            ThemeMood::Synthwave84 => "neon",
+        };
+        let description = match self.mood {
+            ThemeMood::Default => "standard palette using the active accent",
+            ThemeMood::Synthwave84 => "synthwave84 glow enabled over the active accent",
+        };
+
+        CommandOutput {
+            title: "mood".to_string(),
+            lines: vec![
+                Line::from(vec![
+                    Span::styled(
+                        "mood  ",
+                        Style::default()
+                            .fg(self.ui.accent)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        theme_mood_name(self.mood).to_string(),
+                        Style::default()
+                            .fg(self.ui.bg)
+                            .bg(self.ui.accent)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(badge, Style::default().fg(self.ui.special)),
+                ]),
+                Line::styled(description, Style::default().fg(self.ui.muted)),
+            ],
         }
     }
 
@@ -1254,11 +1336,13 @@ impl App {
             root: self.project_tree.root.clone(),
             open_files,
             active_file,
-            accent_hex: Some(color_hex(self.ui.accent)),
+            accent_hex: Some(self.accent_hex.clone()),
+            mood: Some(theme_mood_name(self.mood).to_string()),
             accent_registry: self.accent_registry.clone(),
         })?;
         save_global_settings(&GlobalSettings {
-            accent_hex: Some(color_hex(self.ui.accent)),
+            accent_hex: Some(self.accent_hex.clone()),
+            mood: Some(theme_mood_name(self.mood).to_string()),
             accent_registry: self.accent_registry.clone(),
         })
     }

@@ -43,8 +43,8 @@ use persistence::{
 use preview::{load_editor_preview, uses_editor_preview};
 use render::render;
 use theme::{
-    accent_preview_line, build_nvim_theme_command, color_hex, normalize_hex_color, nvim_theme_lua,
-    ui_theme,
+    accent_preview_line, build_nvim_theme_command, normalize_hex_color, normalize_theme_mood,
+    nvim_theme_lua, theme_mood_name, ui_theme,
 };
 
 const ACCENT_COLOR: &str = "#ffffff";
@@ -95,11 +95,22 @@ enum AppAction {
     Quit,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ThemeMood {
+    Default,
+    Synthwave84,
+}
+
 #[derive(Clone, Copy)]
 struct UiTheme {
+    mood: ThemeMood,
     accent: Color,
     accent_soft: Color,
     accent_dim: Color,
+    glow_outer: Color,
+    glow_inner: Color,
+    glow_hot: Color,
+    glow_fill: Color,
     bg: Color,
     panel: Color,
     panel_alt: Color,
@@ -115,6 +126,8 @@ struct UiTheme {
 struct App {
     focus: Focus,
     status_message: String,
+    accent_hex: String,
+    mood: ThemeMood,
     ui: UiTheme,
     accent_registry: BTreeMap<String, String>,
     command_output: Option<CommandOutput>,
@@ -325,11 +338,13 @@ struct SessionState {
     open_files: Vec<PathBuf>,
     active_file: Option<PathBuf>,
     accent_hex: Option<String>,
+    mood: Option<String>,
     accent_registry: BTreeMap<String, String>,
 }
 
 struct GlobalSettings {
     accent_hex: Option<String>,
+    mood: Option<String>,
     accent_registry: BTreeMap<String, String>,
 }
 
@@ -1167,7 +1182,10 @@ fn io_error(error: impl std::fmt::Display) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use crate::theme::normalize_hex_color;
+    use crate::{
+        ThemeMood,
+        theme::{normalize_hex_color, normalize_theme_mood, ui_theme},
+    };
 
     #[test]
     fn normalize_hex_color_keeps_single_hash() {
@@ -1177,5 +1195,23 @@ mod tests {
     #[test]
     fn normalize_hex_color_recovers_double_hash_values() {
         assert_eq!(normalize_hex_color("##123AbC"), Some("#123abc".to_string()));
+    }
+
+    #[test]
+    fn normalize_theme_mood_accepts_synthwave_aliases() {
+        assert_eq!(
+            normalize_theme_mood("synthwave"),
+            Some(ThemeMood::Synthwave84)
+        );
+        assert_eq!(normalize_theme_mood("neon"), Some(ThemeMood::Synthwave84));
+        assert_eq!(normalize_theme_mood("off"), Some(ThemeMood::Default));
+    }
+
+    #[test]
+    fn synthwave_theme_exposes_distinct_glow_colors() {
+        let ui = ui_theme("#ff4fd8", ThemeMood::Synthwave84);
+        assert_ne!(ui.glow_hot, ui.accent);
+        assert_ne!(ui.glow_fill, ui.panel);
+        assert_eq!(ui.mood, ThemeMood::Synthwave84);
     }
 }

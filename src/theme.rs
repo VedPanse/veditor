@@ -5,16 +5,46 @@ use ratatui::{
     text::{Line, Span},
 };
 
-use crate::UiTheme;
+use crate::{ThemeMood, UiTheme};
 
-/// Builds the full UI palette from a single accent color.
-pub(crate) fn ui_theme(accent_hex: &str) -> UiTheme {
+/// Builds the full UI palette from a single accent color and mood.
+pub(crate) fn ui_theme(accent_hex: &str, mood: ThemeMood) -> UiTheme {
     let accent = color_to_rgb(parse_hex_color(accent_hex).unwrap_or(Color::Rgb(30, 144, 255)));
+    match mood {
+        ThemeMood::Default => default_theme(accent),
+        ThemeMood::Synthwave84 => synthwave84_theme(accent),
+    }
+}
+
+/// Parses supported theme mood aliases into the canonical mood variant.
+pub(crate) fn normalize_theme_mood(value: &str) -> Option<ThemeMood> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "default" | "normal" | "none" | "off" => Some(ThemeMood::Default),
+        "mood" | "synthwave" | "synthwave84" | "synthwave-84" | "neon" | "glow" => {
+            Some(ThemeMood::Synthwave84)
+        }
+        _ => None,
+    }
+}
+
+/// Returns the canonical persisted name for a theme mood.
+pub(crate) fn theme_mood_name(mood: ThemeMood) -> &'static str {
+    match mood {
+        ThemeMood::Default => "default",
+        ThemeMood::Synthwave84 => "synthwave84",
+    }
+}
+
+fn default_theme(accent: RgbColor) -> UiTheme {
     let bg = mix(rgb(3, 4, 8), accent, 0.10);
     let panel = mix(rgb(7, 10, 18), accent, 0.16);
     let panel_alt = mix(rgb(12, 16, 28), accent, 0.24);
     let accent_soft = mix(accent, rgb(255, 255, 255), 0.24);
     let accent_dim = mix(accent, bg, 0.38);
+    let glow_outer = mix(panel, bg, 0.30);
+    let glow_inner = mix(accent, panel_alt, 0.34);
+    let glow_hot = mix(accent_soft, rgb(255, 255, 255), 0.18);
+    let glow_fill = mix(panel_alt, accent, 0.20);
     let text = mix(rgb(245, 247, 250), accent, 0.18);
     let muted = mix(text, panel_alt, 0.44);
     let border = mix(panel_alt, accent, 0.55);
@@ -41,9 +71,75 @@ pub(crate) fn ui_theme(accent_hex: &str) -> UiTheme {
     ];
 
     UiTheme {
+        mood: ThemeMood::Default,
         accent: rgb_to_color(accent),
         accent_soft: rgb_to_color(accent_soft),
         accent_dim: rgb_to_color(accent_dim),
+        glow_outer: rgb_to_color(glow_outer),
+        glow_inner: rgb_to_color(glow_inner),
+        glow_hot: rgb_to_color(glow_hot),
+        glow_fill: rgb_to_color(glow_fill),
+        bg: rgb_to_color(bg),
+        panel: rgb_to_color(panel),
+        panel_alt: rgb_to_color(panel_alt),
+        text: rgb_to_color(text),
+        muted: rgb_to_color(muted),
+        border: rgb_to_color(border),
+        selection: rgb_to_color(selection),
+        special: rgb_to_color(special),
+        type_color: rgb_to_color(type_color),
+        ansi,
+    }
+}
+
+fn synthwave84_theme(accent: RgbColor) -> UiTheme {
+    let neon_pink = mix(rgb(255, 48, 184), accent, 0.35);
+    let neon_cyan = mix(rgb(58, 245, 255), accent, 0.18);
+    let sunset = rgb(255, 170, 74);
+    let bg = rgb(10, 4, 30);
+    let panel = mix(bg, neon_pink, 0.16);
+    let panel_alt = mix(mix(bg, neon_cyan, 0.14), neon_pink, 0.08);
+    let accent = mix(neon_pink, neon_cyan, 0.14);
+    let accent_soft = mix(neon_cyan, rgb(255, 255, 255), 0.24);
+    let accent_dim = mix(accent, bg, 0.42);
+    let glow_outer = mix(neon_pink, bg, 0.22);
+    let glow_inner = mix(neon_cyan, neon_pink, 0.45);
+    let glow_hot = mix(neon_cyan, rgb(255, 255, 255), 0.34);
+    let glow_fill = mix(mix(bg, neon_pink, 0.32), neon_cyan, 0.16);
+    let text = mix(rgb(255, 245, 253), neon_cyan, 0.10);
+    let muted = mix(text, panel_alt, 0.52);
+    let border = mix(neon_cyan, neon_pink, 0.40);
+    let selection = mix(mix(bg, accent, 0.52), neon_cyan, 0.14);
+    let special = mix(neon_cyan, sunset, 0.28);
+    let type_color = mix(neon_cyan, accent, 0.22);
+    let ansi = [
+        rgb_to_color(bg),
+        rgb_to_color(mix(rgb(255, 64, 151), bg, 0.22)),
+        rgb_to_color(mix(neon_cyan, bg, 0.12)),
+        rgb_to_color(sunset),
+        rgb_to_color(accent),
+        rgb_to_color(mix(accent, rgb(255, 255, 255), 0.16)),
+        rgb_to_color(neon_cyan),
+        rgb_to_color(text),
+        rgb_to_color(panel_alt),
+        rgb_to_color(mix(rgb(255, 99, 205), text, 0.18)),
+        rgb_to_color(mix(neon_cyan, text, 0.18)),
+        rgb_to_color(mix(sunset, text, 0.18)),
+        rgb_to_color(mix(accent, rgb(255, 255, 255), 0.32)),
+        rgb_to_color(mix(accent_soft, text, 0.22)),
+        rgb_to_color(mix(neon_cyan, rgb(255, 255, 255), 0.18)),
+        rgb_to_color(rgb(252, 248, 255)),
+    ];
+
+    UiTheme {
+        mood: ThemeMood::Synthwave84,
+        accent: rgb_to_color(accent),
+        accent_soft: rgb_to_color(accent_soft),
+        accent_dim: rgb_to_color(accent_dim),
+        glow_outer: rgb_to_color(glow_outer),
+        glow_inner: rgb_to_color(glow_inner),
+        glow_hot: rgb_to_color(glow_hot),
+        glow_fill: rgb_to_color(glow_fill),
         bg: rgb_to_color(bg),
         panel: rgb_to_color(panel),
         panel_alt: rgb_to_color(panel_alt),
@@ -212,7 +308,7 @@ fn mix(a: RgbColor, b: RgbColor, ratio: f32) -> RgbColor {
 pub(crate) fn nvim_theme_lua(ui: UiTheme) -> String {
     let ansi = ui.ansi.map(color_hex);
     format!(
-        "local p={{bg='{bg}',panel='{panel}',panel_alt='{panel_alt}',text='{text}',muted='{muted}',accent='{accent}',accent_soft='{accent_soft}',accent_dim='{accent_dim}',special='{special}',type_='{type_color}',select='{selection}'}} local set=vim.api.nvim_set_hl set(0,'Normal',{{fg=p.text,bg=p.panel}}) set(0,'NormalNC',{{fg=p.text,bg=p.panel}}) set(0,'NormalFloat',{{fg=p.text,bg=p.panel_alt}}) set(0,'FloatBorder',{{fg=p.accent_dim,bg=p.panel_alt}}) set(0,'SignColumn',{{bg=p.panel}}) set(0,'EndOfBuffer',{{fg=p.panel,bg=p.panel}}) set(0,'LineNr',{{fg=p.muted,bg=p.panel}}) set(0,'CursorLineNr',{{fg=p.accent,bg=p.panel,bold=true}}) set(0,'CursorLine',{{bg=p.bg}}) set(0,'CursorColumn',{{bg=p.bg}}) set(0,'ColorColumn',{{bg=p.bg}}) set(0,'Visual',{{bg=p.select}}) set(0,'Search',{{fg=p.bg,bg=p.accent}}) set(0,'IncSearch',{{fg=p.bg,bg=p.accent_soft,bold=true}}) set(0,'MatchParen',{{fg=p.accent_soft,bg=p.bg,bold=true}}) set(0,'StatusLine',{{fg=p.bg,bg=p.accent,bold=true}}) set(0,'StatusLineNC',{{fg=p.text,bg=p.panel_alt}}) set(0,'VertSplit',{{fg=p.accent_dim,bg=p.panel}}) set(0,'WinSeparator',{{fg=p.accent_dim,bg=p.panel}}) set(0,'Pmenu',{{fg=p.text,bg=p.panel_alt}}) set(0,'PmenuSel',{{fg=p.bg,bg=p.accent}}) set(0,'Comment',{{fg=p.muted,italic=true}}) set(0,'Constant',{{fg=p.accent_soft}}) set(0,'String',{{fg=p.type_}}) set(0,'Character',{{fg=p.type_}}) set(0,'Number',{{fg=p.special}}) set(0,'Boolean',{{fg=p.special,bold=true}}) set(0,'Float',{{fg=p.special}}) set(0,'Identifier',{{fg=p.text}}) set(0,'Function',{{fg=p.accent_soft,bold=true}}) set(0,'Statement',{{fg=p.accent,bold=true}}) set(0,'Conditional',{{fg=p.accent,bold=true}}) set(0,'Repeat',{{fg=p.accent,bold=true}}) set(0,'Label',{{fg=p.accent}}) set(0,'Operator',{{fg=p.text}}) set(0,'Keyword',{{fg=p.accent,bold=true}}) set(0,'Exception',{{fg=p.special,bold=true}}) set(0,'PreProc',{{fg=p.type_}}) set(0,'Include',{{fg=p.type_}}) set(0,'Define',{{fg=p.type_}}) set(0,'Macro',{{fg=p.type_}}) set(0,'PreCondit',{{fg=p.type_}}) set(0,'Type',{{fg=p.type_,bold=true}}) set(0,'StorageClass',{{fg=p.type_}}) set(0,'Structure',{{fg=p.type_}}) set(0,'Typedef',{{fg=p.type_}}) set(0,'Special',{{fg=p.special}}) set(0,'SpecialChar',{{fg=p.special}}) set(0,'Delimiter',{{fg=p.accent_dim}}) set(0,'SpecialComment',{{fg=p.muted}}) set(0,'Todo',{{fg=p.bg,bg=p.accent_soft,bold=true}}) vim.g.terminal_color_0='{c0}' vim.g.terminal_color_1='{c1}' vim.g.terminal_color_2='{c2}' vim.g.terminal_color_3='{c3}' vim.g.terminal_color_4='{c4}' vim.g.terminal_color_5='{c5}' vim.g.terminal_color_6='{c6}' vim.g.terminal_color_7='{c7}' vim.g.terminal_color_8='{c8}' vim.g.terminal_color_9='{c9}' vim.g.terminal_color_10='{c10}' vim.g.terminal_color_11='{c11}' vim.g.terminal_color_12='{c12}' vim.g.terminal_color_13='{c13}' vim.g.terminal_color_14='{c14}' vim.g.terminal_color_15='{c15}'",
+        "local p={{bg='{bg}',panel='{panel}',panel_alt='{panel_alt}',text='{text}',muted='{muted}',accent='{accent}',accent_soft='{accent_soft}',accent_dim='{accent_dim}',glow_outer='{glow_outer}',glow_inner='{glow_inner}',glow_hot='{glow_hot}',glow_fill='{glow_fill}',special='{special}',type_='{type_color}',select='{selection}'}} local set=vim.api.nvim_set_hl set(0,'Normal',{{fg=p.text,bg=p.panel}}) set(0,'NormalNC',{{fg=p.text,bg=p.panel}}) set(0,'NormalFloat',{{fg=p.text,bg=p.glow_fill}}) set(0,'FloatBorder',{{fg=p.glow_hot,bg=p.glow_fill,bold=true}}) set(0,'SignColumn',{{bg=p.panel}}) set(0,'EndOfBuffer',{{fg=p.panel,bg=p.panel}}) set(0,'LineNr',{{fg=p.muted,bg=p.panel}}) set(0,'CursorLineNr',{{fg=p.glow_hot,bg=p.glow_fill,bold=true}}) set(0,'CursorLine',{{bg=p.glow_fill}}) set(0,'CursorColumn',{{bg=p.glow_fill}}) set(0,'ColorColumn',{{bg=p.glow_fill}}) set(0,'Visual',{{fg=p.text,bg=p.select,bold=true}}) set(0,'Search',{{fg=p.bg,bg=p.glow_hot,bold=true}}) set(0,'CurSearch',{{fg=p.bg,bg=p.glow_hot,bold=true}}) set(0,'IncSearch',{{fg=p.bg,bg=p.accent_soft,bold=true}}) set(0,'MatchParen',{{fg=p.glow_hot,bg=p.glow_fill,bold=true}}) set(0,'StatusLine',{{fg=p.bg,bg=p.glow_hot,bold=true}}) set(0,'StatusLineNC',{{fg=p.text,bg=p.glow_fill}}) set(0,'TabLineSel',{{fg=p.bg,bg=p.glow_hot,bold=true}}) set(0,'VertSplit',{{fg=p.glow_inner,bg=p.panel}}) set(0,'WinSeparator',{{fg=p.glow_hot,bg=p.panel,bold=true}}) set(0,'Pmenu',{{fg=p.text,bg=p.panel_alt}}) set(0,'PmenuSel',{{fg=p.bg,bg=p.glow_hot,bold=true}}) set(0,'Comment',{{fg=p.muted,italic=true}}) set(0,'Constant',{{fg=p.accent_soft}}) set(0,'String',{{fg=p.type_}}) set(0,'Character',{{fg=p.type_}}) set(0,'Number',{{fg=p.special}}) set(0,'Boolean',{{fg=p.special,bold=true}}) set(0,'Float',{{fg=p.special}}) set(0,'Identifier',{{fg=p.text}}) set(0,'Function',{{fg=p.accent_soft,bold=true}}) set(0,'Statement',{{fg=p.accent,bold=true}}) set(0,'Conditional',{{fg=p.accent,bold=true}}) set(0,'Repeat',{{fg=p.accent,bold=true}}) set(0,'Label',{{fg=p.accent}}) set(0,'Operator',{{fg=p.text}}) set(0,'Keyword',{{fg=p.accent,bold=true}}) set(0,'Exception',{{fg=p.special,bold=true}}) set(0,'PreProc',{{fg=p.type_}}) set(0,'Include',{{fg=p.type_}}) set(0,'Define',{{fg=p.type_}}) set(0,'Macro',{{fg=p.type_}}) set(0,'PreCondit',{{fg=p.type_}}) set(0,'Type',{{fg=p.type_,bold=true}}) set(0,'StorageClass',{{fg=p.type_}}) set(0,'Structure',{{fg=p.type_}}) set(0,'Typedef',{{fg=p.type_}}) set(0,'Special',{{fg=p.special}}) set(0,'SpecialChar',{{fg=p.special}}) set(0,'Delimiter',{{fg=p.accent_dim}}) set(0,'SpecialComment',{{fg=p.muted}}) set(0,'Todo',{{fg=p.bg,bg=p.accent_soft,bold=true}}) set(0,'DiagnosticVirtualTextError',{{fg=p.glow_hot,bg=p.glow_fill}}) set(0,'DiagnosticVirtualTextWarn',{{fg=p.special,bg=p.glow_fill}}) set(0,'DiagnosticVirtualTextInfo',{{fg=p.accent_soft,bg=p.glow_fill}}) set(0,'DiagnosticVirtualTextHint',{{fg=p.glow_inner,bg=p.glow_fill}}) vim.g.terminal_color_0='{c0}' vim.g.terminal_color_1='{c1}' vim.g.terminal_color_2='{c2}' vim.g.terminal_color_3='{c3}' vim.g.terminal_color_4='{c4}' vim.g.terminal_color_5='{c5}' vim.g.terminal_color_6='{c6}' vim.g.terminal_color_7='{c7}' vim.g.terminal_color_8='{c8}' vim.g.terminal_color_9='{c9}' vim.g.terminal_color_10='{c10}' vim.g.terminal_color_11='{c11}' vim.g.terminal_color_12='{c12}' vim.g.terminal_color_13='{c13}' vim.g.terminal_color_14='{c14}' vim.g.terminal_color_15='{c15}'",
         bg = color_hex(ui.bg),
         panel = color_hex(ui.panel),
         panel_alt = color_hex(ui.panel_alt),
@@ -221,6 +317,10 @@ pub(crate) fn nvim_theme_lua(ui: UiTheme) -> String {
         accent = color_hex(ui.accent),
         accent_soft = color_hex(ui.accent_soft),
         accent_dim = color_hex(ui.accent_dim),
+        glow_outer = color_hex(ui.glow_outer),
+        glow_inner = color_hex(ui.glow_inner),
+        glow_hot = color_hex(ui.glow_hot),
+        glow_fill = color_hex(ui.glow_fill),
         special = color_hex(ui.special),
         type_color = color_hex(ui.type_color),
         selection = color_hex(ui.selection),
