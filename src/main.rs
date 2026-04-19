@@ -5,8 +5,8 @@ use std::{
 	path::{Path, PathBuf},
 	process::{Command, Stdio},
 	sync::{
-		mpsc::{self, Receiver, Sender},
 		Arc, Mutex,
+		mpsc::{self, Receiver, Sender},
 	},
 	thread,
 	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -17,14 +17,14 @@ use crossterm::event::{
 };
 use image::imageops::FilterType;
 use image::{DynamicImage, GenericImageView, ImageReader};
-use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use ratatui::{
+	DefaultTerminal,
 	layout::{Constraint, Direction, Layout, Rect},
 	prelude::*,
 	style::{Color, Modifier, Style},
 	text::{Line, Span},
 	widgets::{Block, BorderType, Gauge, List, ListItem, ListState, Paragraph, Sparkline, Wrap},
-	DefaultTerminal,
 };
 use vt100::{Color as VtColor, Parser};
 
@@ -307,6 +307,11 @@ struct SessionState {
 	accent_registry: BTreeMap<String, String>,
 }
 
+struct GlobalSettings {
+	accent_hex: Option<String>,
+	accent_registry: BTreeMap<String, String>,
+}
+
 struct NvimBufferState {
 	files: Vec<PathBuf>,
 	current: Option<PathBuf>,
@@ -330,12 +335,29 @@ struct WorkspaceFileState {
 
 impl App {
 	fn new(requested_path: Option<PathBuf>) -> io::Result<Self> {
+		let global_settings = load_global_settings();
 		let saved_session = load_saved_session();
-		let accent_hex = saved_session
+		let saved_accent_hex = global_settings
 			.as_ref()
-			.and_then(|session| session.accent_hex.as_deref())
+			.and_then(|settings| settings.accent_hex.as_deref())
 			.and_then(normalize_hex_color)
+			.or_else(|| {
+				saved_session
+					.as_ref()
+					.and_then(|session| session.accent_hex.as_deref())
+					.and_then(normalize_hex_color)
+			})
 			.unwrap_or_else(|| ACCENT_COLOR.to_string());
+		let saved_accent_registry = global_settings
+			.as_ref()
+			.map(|settings| settings.accent_registry.clone())
+			.filter(|registry| !registry.is_empty())
+			.or_else(|| {
+				saved_session
+					.as_ref()
+					.map(|session| session.accent_registry.clone())
+			})
+			.unwrap_or_default();
 		let cwd = env::current_dir()?;
 		let (root, saved_session, requested_path) = if let Some(requested_path) = requested_path {
 			let requested_path = absolutize_path(&cwd, &requested_path);
@@ -347,10 +369,7 @@ impl App {
 			let root = if requested_path.is_dir() {
 				requested_path.clone()
 			} else {
-				requested_path
-					.parent()
-					.unwrap_or(&cwd)
-					.to_path_buf()
+				requested_path.parent().unwrap_or(&cwd).to_path_buf()
 			};
 			(root, None, Some(requested_path))
 		} else {
@@ -360,11 +379,8 @@ impl App {
 				.unwrap_or(cwd);
 			(root, saved_session, None)
 		};
-		let ui = ui_theme(&accent_hex);
-		let accent_registry = saved_session
-			.as_ref()
-			.map(|session| session.accent_registry.clone())
-			.unwrap_or_default();
+		let ui = ui_theme(&saved_accent_hex);
+		let accent_registry = saved_accent_registry;
 		let restored_files = saved_session
 			.as_ref()
 			.map(|session| sanitize_session_files(&root, &session.open_files))
@@ -611,7 +627,8 @@ impl App {
 			}
 			KeyCode::Enter => {
 				if self.project_tree.search_active() && !self.project_tree.has_search_match() {
-					self.status_message = format!("no match for {}", self.project_tree.search_query);
+					self.status_message =
+						format!("no match for {}", self.project_tree.search_query);
 					return AppAction::Continue;
 				}
 
@@ -633,9 +650,9 @@ impl App {
 				AppAction::Continue
 			}
 			KeyCode::Char(ch)
-				if !key
-					.modifiers
-					.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) =>
+				if !key.modifiers.intersects(
+					KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+				) =>
 			{
 				let update = self.project_tree.push_search_text(&ch.to_string());
 				self.apply_project_tree_search_update(update);
@@ -694,9 +711,9 @@ impl App {
 				}
 			}
 			KeyCode::Char(ch)
-				if !key
-					.modifiers
-					.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) =>
+				if !key.modifiers.intersects(
+					KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+				) =>
 			{
 				self.push_command_prompt_text(&ch.to_string());
 			}
@@ -748,16 +765,17 @@ impl App {
 					return AppAction::Continue;
 				}
 
-				if let Err(error) =
-					self.commit_project_picker_selection(key.modifiers.contains(KeyModifiers::SHIFT))
+				if let Err(error) = self
+					.commit_project_picker_selection(key.modifiers.contains(KeyModifiers::SHIFT))
 				{
 					self.status_message = format!("switch failed: {error}");
 				}
 			}
-			KeyCode::Backspace if self
-				.project_picker
-				.as_ref()
-				.is_some_and(ProjectPicker::search_active) =>
+			KeyCode::Backspace
+				if self
+					.project_picker
+					.as_ref()
+					.is_some_and(ProjectPicker::search_active) =>
 			{
 				let update = if let Some(picker) = &mut self.project_picker {
 					picker.backspace_search()
@@ -777,9 +795,9 @@ impl App {
 				}
 			}
 			KeyCode::Char(ch)
-				if !key
-					.modifiers
-					.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) =>
+				if !key.modifiers.intersects(
+					KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+				) =>
 			{
 				let update = if let Some(picker) = &mut self.project_picker {
 					picker.push_search_text(&ch.to_string())
@@ -890,7 +908,8 @@ impl App {
 			Ok(picker) => {
 				self.project_picker = Some(picker);
 				self.status_message =
-					"select a project. enter opens project, shift+enter opens directory".to_string();
+					"select a project. enter opens project, shift+enter opens directory"
+						.to_string();
 			}
 			Err(error) => {
 				self.status_message = format!("switch failed: {error}");
@@ -984,8 +1003,10 @@ impl App {
 				self.status_message = "cleared tree search".to_string();
 			}
 			TreeSearchUpdate::Matched(path) => {
-				self.status_message =
-					format!("tree search: {}", relative_to_root(&self.project_tree.root, &path));
+				self.status_message = format!(
+					"tree search: {}",
+					relative_to_root(&self.project_tree.root, &path)
+				);
 			}
 			TreeSearchUpdate::NoMatch => {
 				self.status_message = format!("no match for {}", self.project_tree.search_query);
@@ -1001,8 +1022,10 @@ impl App {
 			}
 			ProjectPickerSearchUpdate::Matched(path) => {
 				if let Some(picker) = &self.project_picker {
-					self.status_message =
-						format!("project search: {}", relative_to_root(&picker.current_dir, &path));
+					self.status_message = format!(
+						"project search: {}",
+						relative_to_root(&picker.current_dir, &path)
+					);
 				}
 			}
 			ProjectPickerSearchUpdate::NoMatch => {
@@ -1023,9 +1046,9 @@ impl App {
 		let parts = trimmed.split_whitespace().collect::<Vec<_>>();
 		match parts.as_slice() {
 			[":set", "accent", value] => {
-				let hex = self.resolve_accent_value(value).ok_or_else(|| {
-					io_error("usage: :set accent #RRGGBB | :set accent <NAME>")
-				})?;
+				let hex = self
+					.resolve_accent_value(value)
+					.ok_or_else(|| io_error("usage: :set accent #RRGGBB | :set accent <NAME>"))?;
 				self.apply_accent_command(&hex)?;
 				self.command_prompt = None;
 				self.command_output = Some(CommandOutput {
@@ -1036,9 +1059,8 @@ impl App {
 				Ok(())
 			}
 			[":set", "accent", hex, "register", name] => {
-				let hex = normalize_hex_color(hex).ok_or_else(|| {
-					io_error("usage: :set accent #RRGGBB register <NAME>")
-				})?;
+				let hex = normalize_hex_color(hex)
+					.ok_or_else(|| io_error("usage: :set accent #RRGGBB register <NAME>"))?;
 				self.register_accent(name, &hex);
 				self.apply_accent_command(&hex)?;
 				self.command_prompt = None;
@@ -1074,9 +1096,9 @@ impl App {
 		}
 
 		let needle = value.trim();
-		self.accent_registry.iter().find_map(|(name, hex)| {
-			name.eq_ignore_ascii_case(needle).then(|| hex.clone())
-		})
+		self.accent_registry
+			.iter()
+			.find_map(|(name, hex)| name.eq_ignore_ascii_case(needle).then(|| hex.clone()))
 	}
 
 	fn register_accent(&mut self, name: &str, hex: &str) {
@@ -1093,7 +1115,8 @@ impl App {
 		{
 			self.accent_registry.remove(&existing_name);
 		}
-		self.accent_registry.insert(needle.to_string(), hex.to_string());
+		self.accent_registry
+			.insert(needle.to_string(), hex.to_string());
 	}
 
 	fn build_accent_registry_output(&self) -> CommandOutput {
@@ -1316,10 +1339,15 @@ impl App {
 
 	fn receive_codex_replies(&mut self) {
 		while let Ok(result) = self.codex_rx.try_recv() {
-			self.pending_codex_request = self.pending_codex_request.filter(|id| *id != result.request_id);
+			self.pending_codex_request = self
+				.pending_codex_request
+				.filter(|id| *id != result.request_id);
 			match result.reply {
 				Ok(response) => {
-					let changed_files = response.change_set.as_ref().map(|change_set| change_set.files.len());
+					let changed_files = response
+						.change_set
+						.as_ref()
+						.map(|change_set| change_set.files.len());
 					self.codex_chat
 						.resolve_pending(result.request_id, response.reply);
 					self.codex_chat.set_change_set(response.change_set);
@@ -1334,10 +1362,8 @@ impl App {
 						.unwrap_or_else(|| "codex replied".to_string());
 				}
 				Err(error) => {
-					self.codex_chat.resolve_pending(
-						result.request_id,
-						format!("request failed: {error}"),
-					);
+					self.codex_chat
+						.resolve_pending(result.request_id, format!("request failed: {error}"));
 					self.status_message = "codex request failed".to_string();
 				}
 			}
@@ -1417,7 +1443,8 @@ impl App {
 		}
 
 		self.codex_chat.clear_change_set();
-		self.codex_chat.push_assistant("undid the last codex change.");
+		self.codex_chat
+			.push_assistant("undid the last codex change.");
 		self.refresh_after_codex_reply();
 		self.status_message = "undid last codex change".to_string();
 		Ok(())
@@ -1432,7 +1459,10 @@ impl App {
 		self.open_files = files.clone();
 		self.active_file = active_file.clone();
 		if initial_editor_target.is_file()
-			&& !self.open_files.iter().any(|path| path == &initial_editor_target)
+			&& !self
+				.open_files
+				.iter()
+				.any(|path| path == &initial_editor_target)
 		{
 			self.open_files.push(initial_editor_target.clone());
 		}
@@ -1504,6 +1534,10 @@ impl App {
 			root: self.project_tree.root.clone(),
 			open_files,
 			active_file,
+			accent_hex: Some(color_hex(self.ui.accent)),
+			accent_registry: self.accent_registry.clone(),
+		})?;
+		save_global_settings(&GlobalSettings {
 			accent_hex: Some(color_hex(self.ui.accent)),
 			accent_registry: self.accent_registry.clone(),
 		})
@@ -1971,12 +2005,16 @@ impl PtyPane {
 		match key.code {
 			KeyCode::Backspace => bytes.push(0x7f),
 			KeyCode::Enter => bytes.push(b'\r'),
-			KeyCode::Left => bytes.extend_from_slice(if app_cursor { b"\x1bOD" } else { b"\x1b[D" }),
+			KeyCode::Left => {
+				bytes.extend_from_slice(if app_cursor { b"\x1bOD" } else { b"\x1b[D" })
+			}
 			KeyCode::Right => {
 				bytes.extend_from_slice(if app_cursor { b"\x1bOC" } else { b"\x1b[C" })
 			}
 			KeyCode::Up => bytes.extend_from_slice(if app_cursor { b"\x1bOA" } else { b"\x1b[A" }),
-			KeyCode::Down => bytes.extend_from_slice(if app_cursor { b"\x1bOB" } else { b"\x1b[B" }),
+			KeyCode::Down => {
+				bytes.extend_from_slice(if app_cursor { b"\x1bOB" } else { b"\x1b[B" })
+			}
 			KeyCode::Home => bytes.extend_from_slice(b"\x1b[H"),
 			KeyCode::End => bytes.extend_from_slice(b"\x1b[F"),
 			KeyCode::PageUp => bytes.extend_from_slice(b"\x1b[5~"),
@@ -2265,7 +2303,11 @@ impl ProjectPicker {
 		}
 
 		if let Some(selected_path) = selected_path {
-			if let Some(index) = self.entries.iter().position(|entry| entry.path == selected_path) {
+			if let Some(index) = self
+				.entries
+				.iter()
+				.position(|entry| entry.path == selected_path)
+			{
 				self.selected = index;
 				return Ok(());
 			}
@@ -2295,7 +2337,9 @@ impl ProjectPicker {
 	}
 
 	fn selected_path(&self) -> Option<PathBuf> {
-		self.entries.get(self.selected).map(|entry| entry.path.clone())
+		self.entries
+			.get(self.selected)
+			.map(|entry| entry.path.clone())
 	}
 
 	fn search_active(&self) -> bool {
@@ -2402,10 +2446,9 @@ impl ImagePreview {
 	}
 
 	fn lines(&mut self, width: u16, height: u16, ui: UiTheme) -> &[Line<'static>] {
-		let refresh = self
-			.cache
-			.as_ref()
-			.is_none_or(|cache| cache.width != width || cache.height != height || cache.panel != ui.panel);
+		let refresh = self.cache.as_ref().is_none_or(|cache| {
+			cache.width != width || cache.height != height || cache.panel != ui.panel
+		});
 		if refresh {
 			self.cache = Some(ImagePreviewCache {
 				width,
@@ -2521,7 +2564,13 @@ fn render(frame: &mut Frame, app: &mut App) {
 		.constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
 		.areas(right);
 
-	render_pty_pane(frame, terminal_area, app.ui, app.focus == Focus::Terminal, &mut app.terminal);
+	render_pty_pane(
+		frame,
+		terminal_area,
+		app.ui,
+		app.focus == Focus::Terminal,
+		&mut app.terminal,
+	);
 	performance_block(frame, performance_area, app);
 	project_tree(frame, left_bottom, app);
 	render_editor(frame, editor_area, app);
@@ -2539,17 +2588,17 @@ fn render_editor(frame: &mut Frame, area: Rect, app: &mut App) {
 			}
 		}
 	} else {
-		render_pty_pane(frame, area, app.ui, app.focus == Focus::Editor, &mut app.nvim);
+		render_pty_pane(
+			frame,
+			area,
+			app.ui,
+			app.focus == Focus::Editor,
+			&mut app.nvim,
+		);
 	}
 }
 
-fn render_pty_pane(
-	frame: &mut Frame,
-	area: Rect,
-	ui: UiTheme,
-	focused: bool,
-	pane: &mut PtyPane,
-) {
+fn render_pty_pane(frame: &mut Frame, area: Rect, ui: UiTheme, focused: bool, pane: &mut PtyPane) {
 	let block = panel(pane.title, ui, focused);
 	let inner = block.inner(area);
 	frame.render_widget(block, area);
@@ -2616,8 +2665,12 @@ fn render_image_preview(
 	.style(Style::default().bg(ui.panel));
 	frame.render_widget(meta, meta_area);
 
-	let widget = Paragraph::new(preview.lines(preview_area.width, preview_area.height, ui).to_vec())
-		.style(Style::default().bg(ui.panel));
+	let widget = Paragraph::new(
+		preview
+			.lines(preview_area.width, preview_area.height, ui)
+			.to_vec(),
+	)
+	.style(Style::default().bg(ui.panel));
 	frame.render_widget(widget, preview_area);
 }
 
@@ -2679,7 +2732,11 @@ fn build_image_preview_lines(
 	let target_width = width as u32;
 	let target_height = height as u32 * 2;
 	let resized = image
-		.resize(target_width.max(1), target_height.max(1), FilterType::Lanczos3)
+		.resize(
+			target_width.max(1),
+			target_height.max(1),
+			FilterType::Lanczos3,
+		)
 		.to_rgba8();
 	let image_width = resized.width() as u16;
 	let image_height = resized.height() as u16;
@@ -2708,7 +2765,10 @@ fn build_image_preview_lines(
 		}
 
 		for col in 0..image_width {
-			let top = blend_rgba_to_rgb(resized.get_pixel(col as u32, image_row as u32 * 2).0, panel_rgb);
+			let top = blend_rgba_to_rgb(
+				resized.get_pixel(col as u32, image_row as u32 * 2).0,
+				panel_rgb,
+			);
 			let bottom_y = image_row as u32 * 2 + 1;
 			let bottom = if bottom_y < image_height as u32 {
 				blend_rgba_to_rgb(resized.get_pixel(col as u32, bottom_y).0, panel_rgb)
@@ -2824,7 +2884,9 @@ fn project_tree(frame: &mut Frame, area: Rect, app: &App) {
 						.bg(app.ui.accent)
 						.add_modifier(Modifier::BOLD)
 				} else if is_startup {
-					Style::default().fg(app.ui.accent).add_modifier(Modifier::BOLD)
+					Style::default()
+						.fg(app.ui.accent)
+						.add_modifier(Modifier::BOLD)
 				} else {
 					Style::default().fg(app.ui.text)
 				};
@@ -2899,7 +2961,10 @@ fn render_project_tree_footer(frame: &mut Frame, area: Rect, app: &App) {
 		(true, true) => {
 			let [output_area, prompt_area] = Layout::default()
 				.direction(Direction::Vertical)
-				.constraints([Constraint::Length(output_height), Constraint::Length(prompt_height)])
+				.constraints([
+					Constraint::Length(output_height),
+					Constraint::Length(prompt_height),
+				])
 				.areas(area);
 			(Some(output_area), Some(prompt_area))
 		}
@@ -2914,7 +2979,9 @@ fn render_project_tree_footer(frame: &mut Frame, area: Rect, app: &App) {
 			.style(Style::default().bg(app.ui.panel_alt))
 			.title(Line::styled(
 				format!(" {} ", output.title),
-				Style::default().fg(app.ui.accent).add_modifier(Modifier::BOLD),
+				Style::default()
+					.fg(app.ui.accent)
+					.add_modifier(Modifier::BOLD),
 			));
 		let widget = Paragraph::new(output.lines.iter().take(6).cloned().collect::<Vec<_>>())
 			.block(block)
@@ -2928,11 +2995,18 @@ fn render_project_tree_footer(frame: &mut Frame, area: Rect, app: &App) {
 			.style(Style::default().bg(app.ui.panel_alt))
 			.title(Line::styled(
 				" command  enter run  esc cancel ",
-				Style::default().fg(app.ui.accent).add_modifier(Modifier::BOLD),
+				Style::default()
+					.fg(app.ui.accent)
+					.add_modifier(Modifier::BOLD),
 			));
 		let command_inner = command_block.inner(prompt_area);
 		let command_widget = Paragraph::new(Line::from(vec![
-			Span::styled(":", Style::default().fg(app.ui.accent).add_modifier(Modifier::BOLD)),
+			Span::styled(
+				":",
+				Style::default()
+					.fg(app.ui.accent)
+					.add_modifier(Modifier::BOLD),
+			),
 			Span::styled(
 				command
 					.strip_prefix(':')
@@ -2993,7 +3067,10 @@ fn performance_block(frame: &mut Frame, area: Rect, app: &App) {
 		Gauge::default()
 			.block(panel("cpu / terminal", app.ui, false))
 			.gauge_style(gauge_style)
-			.label(format!("{:.1}% {}", metrics.cpu_percent, metrics.active_process))
+			.label(format!(
+				"{:.1}% {}",
+				metrics.cpu_percent, metrics.active_process
+			))
 			.percent(cpu_percent),
 		cpu_area,
 	);
@@ -3030,7 +3107,15 @@ fn performance_block(frame: &mut Frame, area: Rect, app: &App) {
 		.block(panel("cpu / history", app.ui, false))
 		.data(&metrics.cpu_history)
 		.style(Style::default().fg(app.ui.accent))
-		.max(metrics.cpu_history.iter().copied().max().unwrap_or(100).max(100));
+		.max(
+			metrics
+				.cpu_history
+				.iter()
+				.copied()
+				.max()
+				.unwrap_or(100)
+				.max(100),
+		);
 
 	frame.render_widget(spark, spark_area);
 }
@@ -3054,7 +3139,11 @@ fn codex_block(frame: &mut Frame, area: Rect, app: &mut App) {
 	let (change_area, history_area, input_area) = if let Some(change_height) = change_height {
 		let [change_area, history_area, input_area] = Layout::default()
 			.direction(Direction::Vertical)
-			.constraints([Constraint::Length(change_height), Constraint::Min(1), Constraint::Length(3)])
+			.constraints([
+				Constraint::Length(change_height),
+				Constraint::Min(1),
+				Constraint::Length(3),
+			])
 			.areas(inner);
 		(Some(change_area), Some(history_area), input_area)
 	} else if inner.height >= 6 {
@@ -3073,7 +3162,11 @@ fn codex_block(frame: &mut Frame, area: Rect, app: &mut App) {
 
 	if let Some(history_area) = history_area {
 		let history_lines = codex_history_lines(app, history_area.width);
-		let scroll = clamp_scroll(app.codex_chat.history_scroll, history_lines.len(), history_area.height);
+		let scroll = clamp_scroll(
+			app.codex_chat.history_scroll,
+			history_lines.len(),
+			history_area.height,
+		);
 		app.codex_chat.history_scroll = scroll;
 		app.codex_history_area = Some(history_area);
 		let history = Paragraph::new(history_lines)
@@ -3091,19 +3184,32 @@ fn codex_block(frame: &mut Frame, area: Rect, app: &mut App) {
 						CreateKind::File => "create file",
 						CreateKind::Directory => "create directory",
 					},
-					Style::default().fg(app.ui.accent).add_modifier(Modifier::BOLD),
+					Style::default()
+						.fg(app.ui.accent)
+						.add_modifier(Modifier::BOLD),
 				),
 				Span::raw("  "),
 				Span::styled(prompt.input.clone(), Style::default().fg(app.ui.text)),
 			]),
-			Line::styled("enter confirm  esc cancel", Style::default().fg(app.ui.muted)),
+			Line::styled(
+				"enter confirm  esc cancel",
+				Style::default().fg(app.ui.muted),
+			),
 		]
 	} else {
 		vec![
 			Line::from(vec![
-				Span::styled("you", Style::default().fg(app.ui.accent).add_modifier(Modifier::BOLD)),
+				Span::styled(
+					"you",
+					Style::default()
+						.fg(app.ui.accent)
+						.add_modifier(Modifier::BOLD),
+				),
 				Span::raw("  "),
-				Span::styled(app.codex_chat.input.clone(), Style::default().fg(app.ui.text)),
+				Span::styled(
+					app.codex_chat.input.clone(),
+					Style::default().fg(app.ui.text),
+				),
 			]),
 			Line::styled("enter send", Style::default().fg(app.ui.muted)),
 		]
@@ -3114,7 +3220,9 @@ fn codex_block(frame: &mut Frame, area: Rect, app: &mut App) {
 		.style(Style::default().bg(app.ui.panel_alt))
 		.title(Line::styled(
 			" chat ",
-			Style::default().fg(app.ui.accent).add_modifier(Modifier::BOLD),
+			Style::default()
+				.fg(app.ui.accent)
+				.add_modifier(Modifier::BOLD),
 		));
 	let input_inner = input_block.inner(input_area);
 	let input = Paragraph::new(input_lines)
@@ -3160,7 +3268,9 @@ fn codex_history_lines(app: &App, width: u16) -> Vec<Line<'static>> {
 		lines.push(Line::from(vec![
 			Span::styled(
 				format!("{label}  "),
-				Style::default().fg(app.ui.accent).add_modifier(Modifier::BOLD),
+				Style::default()
+					.fg(app.ui.accent)
+					.add_modifier(Modifier::BOLD),
 			),
 			Span::styled(content, Style::default().fg(app.ui.text)),
 		]));
@@ -3184,7 +3294,9 @@ fn render_codex_change_block(
 		.style(Style::default().bg(app.ui.panel_alt))
 		.title(Line::styled(
 			" changes ",
-			Style::default().fg(app.ui.accent).add_modifier(Modifier::BOLD),
+			Style::default()
+				.fg(app.ui.accent)
+				.add_modifier(Modifier::BOLD),
 		));
 	let inner = block.inner(area);
 	frame.render_widget(block, area);
@@ -3235,7 +3347,11 @@ fn render_codex_change_block(
 		.iter()
 		.map(|file| codex_changed_file_line(app, file, list_area.width))
 		.collect::<Vec<_>>();
-	let scroll = clamp_scroll(app.codex_chat.change_scroll, file_lines.len(), list_area.height);
+	let scroll = clamp_scroll(
+		app.codex_chat.change_scroll,
+		file_lines.len(),
+		list_area.height,
+	);
 	let list = Paragraph::new(file_lines)
 		.style(Style::default().bg(app.ui.panel_alt))
 		.scroll((scroll as u16, 0))
@@ -3296,7 +3412,9 @@ fn codex_changed_file_line(app: &App, file: &CodexChangedFile, width: u16) -> Li
 		if file.additions > 0 {
 			spans.push(Span::styled(
 				format!("+{}", file.additions),
-				Style::default().fg(app.ui.ansi[2]).add_modifier(Modifier::BOLD),
+				Style::default()
+					.fg(app.ui.ansi[2])
+					.add_modifier(Modifier::BOLD),
 			));
 		}
 		if file.deletions > 0 {
@@ -3305,7 +3423,9 @@ fn codex_changed_file_line(app: &App, file: &CodexChangedFile, width: u16) -> Li
 			}
 			spans.push(Span::styled(
 				format!("-{}", file.deletions),
-				Style::default().fg(app.ui.ansi[1]).add_modifier(Modifier::BOLD),
+				Style::default()
+					.fg(app.ui.ansi[1])
+					.add_modifier(Modifier::BOLD),
 			));
 		}
 	}
@@ -3411,8 +3531,7 @@ fn is_project_open_shortcut(key: KeyEvent) -> bool {
 }
 
 fn is_command_prompt_start(key: KeyEvent) -> bool {
-	!key
-		.modifiers
+	!key.modifiers
 		.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
 		&& matches!(key.code, KeyCode::Char(':'))
 }
@@ -3569,6 +3688,66 @@ fn save_saved_session(session: &SessionState) -> io::Result<()> {
 	fs::write(path, contents)
 }
 
+fn load_global_settings() -> Option<GlobalSettings> {
+	let path = settings_path()?;
+	let contents = fs::read_to_string(path).ok()?;
+	let value: serde_json::Value = serde_json::from_str(&contents).ok()?;
+	let accent_hex = value
+		.get("accent_hex")
+		.and_then(serde_json::Value::as_str)
+		.map(str::to_string);
+	let accent_registry = value
+		.get("accent_registry")
+		.and_then(serde_json::Value::as_object)
+		.map(|entries| {
+			entries
+				.iter()
+				.filter_map(|(name, value)| {
+					value
+						.as_str()
+						.and_then(normalize_hex_color)
+						.map(|hex| (name.to_string(), hex))
+				})
+				.collect::<BTreeMap<_, _>>()
+		})
+		.unwrap_or_default();
+
+	Some(GlobalSettings {
+		accent_hex,
+		accent_registry,
+	})
+}
+
+fn save_global_settings(settings: &GlobalSettings) -> io::Result<()> {
+	let Some(path) = settings_path() else {
+		return Ok(());
+	};
+	if let Some(parent) = path.parent() {
+		fs::create_dir_all(parent)?;
+	}
+
+	let mut accent_registry = load_global_settings()
+		.map(|saved| saved.accent_registry)
+		.unwrap_or_default();
+	for (name, hex) in &settings.accent_registry {
+		if let Some(existing_name) = accent_registry
+			.keys()
+			.find(|existing| existing.eq_ignore_ascii_case(name))
+			.cloned()
+		{
+			accent_registry.remove(&existing_name);
+		}
+		accent_registry.insert(name.clone(), hex.clone());
+	}
+
+	let payload = serde_json::json!({
+		"accent_hex": settings.accent_hex,
+		"accent_registry": accent_registry,
+	});
+	let contents = serde_json::to_string_pretty(&payload).map_err(io_error)?;
+	fs::write(path, contents)
+}
+
 fn parse_nvim_buffer_state(contents: &str) -> Option<NvimBufferState> {
 	let value: serde_json::Value = serde_json::from_str(contents).ok()?;
 	let files = value
@@ -3596,6 +3775,11 @@ fn session_state_path() -> Option<PathBuf> {
 	Some(PathBuf::from(home).join(".veditor").join("session.json"))
 }
 
+fn settings_path() -> Option<PathBuf> {
+	let home = env::var_os("HOME")?;
+	Some(PathBuf::from(home).join(".veditor").join("settings.json"))
+}
+
 fn nvim_snapshot_path() -> io::Result<PathBuf> {
 	let Some(path) = session_state_path() else {
 		return Err(io_error("home directory unavailable"));
@@ -3613,7 +3797,10 @@ fn find_first_project_file(dir: &Path) -> Option<PathBuf> {
 
 	for entry in entries {
 		let path = entry.path();
-		let name = path.file_name().and_then(|value| value.to_str()).unwrap_or_default();
+		let name = path
+			.file_name()
+			.and_then(|value| value.to_str())
+			.unwrap_or_default();
 		if name == ".git" || name == "target" || name.ends_with(".swp") {
 			continue;
 		}
@@ -3667,20 +3854,45 @@ fn truncate_with_ellipsis(text: &str, max_chars: usize) -> String {
 
 fn accent_preview_line(prefix: &str, name: &str, hex: &str, ui: UiTheme) -> Line<'static> {
 	let accent = parse_hex_color(hex).unwrap_or(ui.accent);
+	let text_color = accent_contrast_color(accent);
 	Line::from(vec![
 		Span::styled(
 			format!("{prefix}  "),
-			Style::default().fg(ui.muted).add_modifier(Modifier::BOLD),
+			Style::default()
+				.fg(text_color)
+				.bg(accent)
+				.add_modifier(Modifier::BOLD),
 		),
-		Span::styled("██", Style::default().fg(accent).bg(accent)),
-		Span::raw("  "),
 		Span::styled(
 			name.to_string(),
-			Style::default().fg(accent).add_modifier(Modifier::BOLD),
+			Style::default()
+				.fg(text_color)
+				.bg(accent)
+				.add_modifier(Modifier::BOLD),
 		),
-		Span::raw("  "),
-		Span::styled(hex.to_string(), Style::default().fg(ui.text)),
+		Span::styled("  ", Style::default().bg(accent)),
+		Span::styled(
+			hex.to_string(),
+			Style::default()
+				.fg(text_color)
+				.bg(accent)
+				.add_modifier(Modifier::BOLD),
+		),
 	])
+}
+
+fn accent_contrast_color(color: Color) -> Color {
+	match color {
+		Color::Rgb(r, g, b) => {
+			let luminance = 0.2126 * f32::from(r) + 0.7152 * f32::from(g) + 0.0722 * f32::from(b);
+			if luminance >= 140.0 {
+				Color::Rgb(18, 18, 18)
+			} else {
+				Color::Rgb(245, 245, 245)
+			}
+		}
+		_ => Color::White,
+	}
 }
 
 fn project_picker_entries(root: &Path) -> io::Result<Vec<ProjectPickerEntry>> {
@@ -3776,7 +3988,10 @@ fn sorted_project_entries(dir: &Path) -> Vec<PathBuf> {
 	paths
 		.into_iter()
 		.filter(|path| {
-			let name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+			let name = path
+				.file_name()
+				.and_then(|name| name.to_str())
+				.unwrap_or_default();
 			let is_dir = path.is_dir();
 			!((is_dir && name.starts_with('.')) || name == "target" || name.ends_with(".swp"))
 		})
@@ -3950,10 +4165,16 @@ fn normalize_diff_header_path(path: &str, working_project: &Path) -> Option<Stri
 		return Some(path.to_string());
 	}
 	if let Some(value) = path.strip_prefix("a/") {
-		return Some(format!("a/{}", normalize_diff_path(value, working_project)?));
+		return Some(format!(
+			"a/{}",
+			normalize_diff_path(value, working_project)?
+		));
 	}
 	if let Some(value) = path.strip_prefix("b/") {
-		return Some(format!("b/{}", normalize_diff_path(value, working_project)?));
+		return Some(format!(
+			"b/{}",
+			normalize_diff_path(value, working_project)?
+		));
 	}
 	Some(normalize_diff_path(path, working_project)?)
 }
@@ -3971,10 +4192,7 @@ fn normalize_diff_path(path: &str, working_project: &Path) -> Option<String> {
 	Some(raw.trim_start_matches("./").to_string())
 }
 
-fn parse_codex_diff_stats(
-	diff: &str,
-	working_project: &Path,
-) -> HashMap<PathBuf, (usize, usize)> {
+fn parse_codex_diff_stats(diff: &str, working_project: &Path) -> HashMap<PathBuf, (usize, usize)> {
 	let mut stats = HashMap::new();
 	let mut current_path = None;
 
@@ -4026,7 +4244,10 @@ fn parse_codex_exec_stdout(stdout: &str) -> (Option<String>, Option<String>) {
 		};
 		match kind {
 			"turn_diff" => {
-				if let Some(diff) = message.get("unified_diff").and_then(serde_json::Value::as_str) {
+				if let Some(diff) = message
+					.get("unified_diff")
+					.and_then(serde_json::Value::as_str)
+				{
 					turn_diff = Some(diff.to_string());
 				}
 			}
@@ -4042,7 +4263,10 @@ fn parse_codex_exec_stdout(stdout: &str) -> (Option<String>, Option<String>) {
 	(turn_diff, last_agent_message)
 }
 
-fn request_codex_reply(working_project: &Path, transcript: &str) -> Result<CodexExecResponse, String> {
+fn request_codex_reply(
+	working_project: &Path,
+	transcript: &str,
+) -> Result<CodexExecResponse, String> {
 	let output_path = codex_last_message_path();
 	let prompt = format!(
 		"You are Codex embedded inside a terminal editor. The current working project is '{}'. Answer directly and concisely. When relevant, treat that path as the project root.\n\n{}",
@@ -4084,7 +4308,9 @@ fn request_codex_reply(working_project: &Path, transcript: &str) -> Result<Codex
 			.map_err(|error| error.to_string())?;
 	}
 
-	let output = child.wait_with_output().map_err(|error| error.to_string())?;
+	let output = child
+		.wait_with_output()
+		.map_err(|error| error.to_string())?;
 	let last_message = fs::read_to_string(&output_path)
 		.ok()
 		.map(|text| text.trim().to_string());
@@ -4210,7 +4436,9 @@ fn sample_terminal_process_tree(root_pid: u32) -> io::Result<TerminalProcessSamp
 		mem_bytes += process.rss_kib.saturating_mul(1024);
 
 		if process.cpu_percent > busiest.cpu_percent
-			|| (busiest.pid == root_pid && process.pid != root_pid && process.cpu_percent >= busiest.cpu_percent)
+			|| (busiest.pid == root_pid
+				&& process.pid != root_pid
+				&& process.cpu_percent >= busiest.cpu_percent)
 		{
 			busiest = process;
 		}
@@ -4355,11 +4583,18 @@ fn parse_hex_color(value: &str) -> Option<Color> {
 }
 
 fn normalize_hex_color(value: &str) -> Option<String> {
-	if value.len() != 7 || !value.starts_with('#') {
+	let trimmed = value.trim();
+	if !trimmed.starts_with('#') {
 		return None;
 	}
 
-	parse_hex_color(value).map(|color| format!("#{}", color_hex(color)))
+	let digits = trimmed.trim_start_matches('#');
+	if digits.len() != 6 {
+		return None;
+	}
+
+	let canonical = format!("#{digits}");
+	parse_hex_color(&canonical).map(color_hex)
 }
 
 #[derive(Clone, Copy)]
@@ -4452,15 +4687,13 @@ fn is_image_path(path: &Path) -> bool {
 }
 
 fn is_pdf_path(path: &Path) -> bool {
-	path
-		.extension()
+	path.extension()
 		.and_then(|value| value.to_str())
 		.is_some_and(|value| value.eq_ignore_ascii_case("pdf"))
 }
 
 fn is_notebook_path(path: &Path) -> bool {
-	path
-		.extension()
+	path.extension()
 		.and_then(|value| value.to_str())
 		.is_some_and(|value| value.eq_ignore_ascii_case("ipynb"))
 }
@@ -4503,7 +4736,10 @@ fn notebook_output_lines(outputs: Option<&serde_json::Value>) -> Vec<String> {
 
 	let mut lines = Vec::new();
 	for output in outputs {
-		match output.get("output_type").and_then(serde_json::Value::as_str) {
+		match output
+			.get("output_type")
+			.and_then(serde_json::Value::as_str)
+		{
 			Some("stream") => {
 				let name = output
 					.get("name")
@@ -4602,4 +4838,19 @@ fn build_nvim_theme_command(ui: UiTheme) -> String {
 
 fn io_error(error: impl std::fmt::Display) -> io::Error {
 	io::Error::other(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::normalize_hex_color;
+
+	#[test]
+	fn normalize_hex_color_keeps_single_hash() {
+		assert_eq!(normalize_hex_color("#123AbC"), Some("#123abc".to_string()));
+	}
+
+	#[test]
+	fn normalize_hex_color_recovers_double_hash_values() {
+		assert_eq!(normalize_hex_color("##123AbC"), Some("#123abc".to_string()));
+	}
 }
