@@ -1,5 +1,5 @@
 use std::{
-	collections::{BTreeSet, HashMap},
+	collections::{BTreeMap, BTreeSet, HashMap},
 	env, fs,
 	io::{self, Read, Write},
 	path::{Path, PathBuf},
@@ -95,6 +95,8 @@ struct App {
 	focus: Focus,
 	status_message: String,
 	ui: UiTheme,
+	accent_registry: BTreeMap<String, String>,
+	command_output: Option<CommandOutput>,
 	project_tree: ProjectTree,
 	codex_chat: CodexChat,
 	codex_tx: Sender<CodexResult>,
@@ -239,6 +241,11 @@ struct CodexChangedFile {
 	deletions: usize,
 }
 
+struct CommandOutput {
+	title: String,
+	lines: Vec<Line<'static>>,
+}
+
 #[derive(Clone, Copy)]
 enum ChatRole {
 	User,
@@ -297,6 +304,7 @@ struct SessionState {
 	open_files: Vec<PathBuf>,
 	active_file: Option<PathBuf>,
 	accent_hex: Option<String>,
+	accent_registry: BTreeMap<String, String>,
 }
 
 struct NvimBufferState {
@@ -353,6 +361,10 @@ impl App {
 			(root, saved_session, None)
 		};
 		let ui = ui_theme(&accent_hex);
+		let accent_registry = saved_session
+			.as_ref()
+			.map(|session| session.accent_registry.clone())
+			.unwrap_or_default();
 		let restored_files = saved_session
 			.as_ref()
 			.map(|session| sanitize_session_files(&root, &session.open_files))
@@ -378,6 +390,8 @@ impl App {
 			focus: Focus::Editor,
 			status_message: "embedded nvim + terminal ready".to_string(),
 			ui,
+			accent_registry,
+			command_output: None,
 			project_tree,
 			codex_chat: CodexChat::new(&root, &startup_target),
 			codex_tx,
@@ -914,6 +928,7 @@ impl App {
 			picker.clear_search();
 		}
 		self.command_prompt = Some(":".to_string());
+		self.command_output = None;
 		self.status_message = "command mode".to_string();
 	}
 
@@ -1000,27 +1015,103 @@ impl App {
 	}
 
 	fn commit_command_prompt(&mut self) -> io::Result<()> {
-		let Some(command) = self.command_prompt.as_ref() else {
+		let Some(command) = self.command_prompt.clone() else {
 			return Ok(());
 		};
 
-		let trimmed = command.trim();
-		let mut parts = trimmed.split_whitespace();
-		match (parts.next(), parts.next(), parts.next(), parts.next(), parts.next()) {
-			(Some(":set"), Some("accent"), Some(value), None, None) => {
-				let hex = normalize_hex_color(value).ok_or_else(|| {
-					io_error("usage: :set accent #RRGGBB")
+		let trimmed = command.trim().to_string();
+		let parts = trimmed.split_whitespace().collect::<Vec<_>>();
+		match parts.as_slice() {
+			[":set", "accent", value] => {
+				let hex = self.resolve_accent_value(value).ok_or_else(|| {
+					io_error("usage: :set accent #RRGGBB | :set accent <NAME>")
 				})?;
-				self.ui = ui_theme(&hex);
-				if !self.nvim.is_exited() {
-					self.nvim.apply_theme(self.ui)?;
-				}
-				let _ = self.persist_session_state(false);
+				self.apply_accent_command(&hex)?;
 				self.command_prompt = None;
+				self.command_output = Some(CommandOutput {
+					title: "accent".to_string(),
+					lines: vec![accent_preview_line("active", value, &hex, self.ui)],
+				});
 				self.status_message = format!("accent set to {hex}");
 				Ok(())
 			}
+			[":set", "accent", hex, "register", name] => {
+				let hex = normalize_hex_color(hex).ok_or_else(|| {
+					io_error("usage: :set accent #RRGGBB register <NAME>")
+				})?;
+				self.register_accent(name, &hex);
+				self.apply_accent_command(&hex)?;
+				self.command_prompt = None;
+				self.command_output = Some(CommandOutput {
+					title: "registered accent".to_string(),
+					lines: vec![accent_preview_line("saved", name, &hex, self.ui)],
+				});
+				self.status_message = format!("registered accent {name} as {hex}");
+				Ok(())
+			}
+			[":get", "accent"] => {
+				self.command_output = Some(self.build_accent_registry_output());
+				self.command_prompt = None;
+				self.status_message = "listed registered accent colors".to_string();
+				Ok(())
+			}
 			_ => Err(io_error("unknown command")),
+		}
+	}
+
+	fn apply_accent_command(&mut self, hex: &str) -> io::Result<()> {
+		self.ui = ui_theme(hex);
+		if !self.nvim.is_exited() {
+			self.nvim.apply_theme(self.ui)?;
+		}
+		let _ = self.persist_session_state(false);
+		Ok(())
+	}
+
+	fn resolve_accent_value(&self, value: &str) -> Option<String> {
+		if let Some(hex) = normalize_hex_color(value) {
+			return Some(hex);
+		}
+
+		let needle = value.trim();
+		self.accent_registry.iter().find_map(|(name, hex)| {
+			name.eq_ignore_ascii_case(needle).then(|| hex.clone())
+		})
+	}
+
+	fn register_accent(&mut self, name: &str, hex: &str) {
+		let needle = name.trim();
+		if needle.is_empty() {
+			return;
+		}
+
+		if let Some(existing_name) = self
+			.accent_registry
+			.keys()
+			.find(|existing| existing.eq_ignore_ascii_case(needle))
+			.cloned()
+		{
+			self.accent_registry.remove(&existing_name);
+		}
+		self.accent_registry.insert(needle.to_string(), hex.to_string());
+	}
+
+	fn build_accent_registry_output(&self) -> CommandOutput {
+		let mut lines = Vec::new();
+		if self.accent_registry.is_empty() {
+			lines.push(Line::styled(
+				"no registered accents",
+				Style::default().fg(self.ui.muted),
+			));
+		} else {
+			for (name, hex) in &self.accent_registry {
+				lines.push(accent_preview_line("accent", name, hex, self.ui));
+			}
+		}
+
+		CommandOutput {
+			title: "registered accents".to_string(),
+			lines,
 		}
 	}
 
@@ -1414,6 +1505,7 @@ impl App {
 			open_files,
 			active_file,
 			accent_hex: Some(color_hex(self.ui.accent)),
+			accent_registry: self.accent_registry.clone(),
 		})
 	}
 
@@ -2671,12 +2763,13 @@ fn project_tree(frame: &mut Frame, area: Rect, app: &App) {
 		return;
 	}
 
-	let (list_area, command_area) = if app.command_prompt.is_some() {
-		let [list_area, command_area] = Layout::default()
+	let footer_height = command_footer_height(app);
+	let (list_area, footer_area) = if footer_height > 0 {
+		let [list_area, footer_area] = Layout::default()
 			.direction(Direction::Vertical)
-			.constraints([Constraint::Min(1), Constraint::Length(4)])
+			.constraints([Constraint::Min(1), Constraint::Length(footer_height)])
 			.areas(inner);
-		(list_area, Some(command_area))
+		(list_area, Some(footer_area))
 	} else {
 		(inner, None)
 	};
@@ -2777,7 +2870,59 @@ fn project_tree(frame: &mut Frame, area: Rect, app: &App) {
 		frame.render_stateful_widget(tree, list_area, &mut state);
 	}
 
-	if let (Some(command), Some(command_area)) = (&app.command_prompt, command_area) {
+	if let Some(footer_area) = footer_area {
+		render_project_tree_footer(frame, footer_area, app);
+	}
+}
+
+fn command_footer_height(app: &App) -> u16 {
+	let mut height = 0;
+	if let Some(output) = &app.command_output {
+		let output_lines = output.lines.len().min(6) as u16;
+		height = height.max(output_lines.saturating_add(2));
+	}
+	if app.command_prompt.is_some() {
+		height = height.saturating_add(4);
+	}
+	height
+}
+
+fn render_project_tree_footer(frame: &mut Frame, area: Rect, app: &App) {
+	let output_height = app
+		.command_output
+		.as_ref()
+		.map(|output| (output.lines.len().min(6) as u16).saturating_add(2))
+		.unwrap_or(0);
+	let prompt_height = if app.command_prompt.is_some() { 4 } else { 0 };
+
+	let (output_area, prompt_area) = match (output_height > 0, prompt_height > 0) {
+		(true, true) => {
+			let [output_area, prompt_area] = Layout::default()
+				.direction(Direction::Vertical)
+				.constraints([Constraint::Length(output_height), Constraint::Length(prompt_height)])
+				.areas(area);
+			(Some(output_area), Some(prompt_area))
+		}
+		(true, false) => (Some(area), None),
+		(false, true) => (None, Some(area)),
+		(false, false) => (None, None),
+	};
+
+	if let (Some(output), Some(output_area)) = (&app.command_output, output_area) {
+		let block = Block::bordered()
+			.border_style(Style::default().fg(app.ui.border))
+			.style(Style::default().bg(app.ui.panel_alt))
+			.title(Line::styled(
+				format!(" {} ", output.title),
+				Style::default().fg(app.ui.accent).add_modifier(Modifier::BOLD),
+			));
+		let widget = Paragraph::new(output.lines.iter().take(6).cloned().collect::<Vec<_>>())
+			.block(block)
+			.wrap(Wrap { trim: false });
+		frame.render_widget(widget, output_area);
+	}
+
+	if let (Some(command), Some(prompt_area)) = (&app.command_prompt, prompt_area) {
 		let command_block = Block::bordered()
 			.border_style(Style::default().fg(app.ui.border))
 			.style(Style::default().bg(app.ui.panel_alt))
@@ -2785,7 +2930,7 @@ fn project_tree(frame: &mut Frame, area: Rect, app: &App) {
 				" command  enter run  esc cancel ",
 				Style::default().fg(app.ui.accent).add_modifier(Modifier::BOLD),
 			));
-		let command_inner = command_block.inner(command_area);
+		let command_inner = command_block.inner(prompt_area);
 		let command_widget = Paragraph::new(Line::from(vec![
 			Span::styled(":", Style::default().fg(app.ui.accent).add_modifier(Modifier::BOLD)),
 			Span::styled(
@@ -2798,7 +2943,7 @@ fn project_tree(frame: &mut Frame, area: Rect, app: &App) {
 		]))
 		.block(command_block)
 		.wrap(Wrap { trim: false });
-		frame.render_widget(command_widget, command_area);
+		frame.render_widget(command_widget, prompt_area);
 
 		let cursor_x = command_inner
 			.x
@@ -3380,12 +3525,28 @@ fn load_saved_session() -> Option<SessionState> {
 		.get("accent_hex")
 		.and_then(serde_json::Value::as_str)
 		.map(str::to_string);
+	let accent_registry = value
+		.get("accent_registry")
+		.and_then(serde_json::Value::as_object)
+		.map(|entries| {
+			entries
+				.iter()
+				.filter_map(|(name, value)| {
+					value
+						.as_str()
+						.and_then(normalize_hex_color)
+						.map(|hex| (name.to_string(), hex))
+				})
+				.collect::<BTreeMap<_, _>>()
+		})
+		.unwrap_or_default();
 
 	Some(SessionState {
 		root,
 		open_files,
 		active_file,
 		accent_hex,
+		accent_registry,
 	})
 }
 
@@ -3402,6 +3563,7 @@ fn save_saved_session(session: &SessionState) -> io::Result<()> {
 		"open_files": session.open_files.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
 		"active_file": session.active_file.as_ref().map(|path| path.display().to_string()),
 		"accent_hex": session.accent_hex,
+		"accent_registry": session.accent_registry,
 	});
 	let contents = serde_json::to_string_pretty(&payload).map_err(io_error)?;
 	fs::write(path, contents)
@@ -3501,6 +3663,24 @@ fn truncate_with_ellipsis(text: &str, max_chars: usize) -> String {
 	let mut output = text.chars().take(keep).collect::<String>();
 	output.push('…');
 	output
+}
+
+fn accent_preview_line(prefix: &str, name: &str, hex: &str, ui: UiTheme) -> Line<'static> {
+	let accent = parse_hex_color(hex).unwrap_or(ui.accent);
+	Line::from(vec![
+		Span::styled(
+			format!("{prefix}  "),
+			Style::default().fg(ui.muted).add_modifier(Modifier::BOLD),
+		),
+		Span::styled("██", Style::default().fg(accent).bg(accent)),
+		Span::raw("  "),
+		Span::styled(
+			name.to_string(),
+			Style::default().fg(accent).add_modifier(Modifier::BOLD),
+		),
+		Span::raw("  "),
+		Span::styled(hex.to_string(), Style::default().fg(ui.text)),
+	])
 }
 
 fn project_picker_entries(root: &Path) -> io::Result<Vec<ProjectPickerEntry>> {
