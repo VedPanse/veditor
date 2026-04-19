@@ -12,7 +12,9 @@ use std::{
 	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+	self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+};
 use image::imageops::FilterType;
 use image::{DynamicImage, GenericImageView, ImageReader};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
@@ -108,6 +110,8 @@ struct App {
 	nvim: PtyPane,
 	terminal: PtyPane,
 	terminal_metrics: TerminalMetrics,
+	codex_history_area: Option<Rect>,
+	codex_change_list_area: Option<Rect>,
 }
 
 struct PtyPane {
@@ -211,6 +215,8 @@ struct CodexChat {
 	messages: Vec<ChatMessage>,
 	input: String,
 	last_change_set: Option<CodexChangeSet>,
+	history_scroll: usize,
+	change_scroll: usize,
 }
 
 struct ChatMessage {
@@ -386,6 +392,8 @@ impl App {
 			active_file: None,
 			nvim: PtyPane::spawn_nvim(initial_editor_target.clone(), root.clone(), ui)?,
 			terminal: PtyPane::spawn_shell(root)?,
+			codex_history_area: None,
+			codex_change_list_area: None,
 		}
 		.with_metrics();
 		app.restore_session_files(restored_files, restored_active, initial_editor_target)?;
@@ -430,11 +438,44 @@ impl App {
 				}
 				AppAction::Continue
 			}
-			Event::Mouse(_) | Event::Resize(_, _) | Event::FocusGained | Event::FocusLost => {
-				AppAction::Continue
-			}
+			Event::Mouse(mouse) => self.handle_mouse(mouse),
+			Event::Resize(_, _) | Event::FocusGained | Event::FocusLost => AppAction::Continue,
 			_ => AppAction::Continue,
 		}
+	}
+
+	fn handle_mouse(&mut self, mouse: MouseEvent) -> AppAction {
+		match mouse.kind {
+			MouseEventKind::ScrollUp => {
+				if self
+					.codex_change_list_area
+					.is_some_and(|area| rect_contains(area, mouse.column, mouse.row))
+				{
+					self.codex_chat.scroll_change_list(-3);
+				} else if self
+					.codex_history_area
+					.is_some_and(|area| rect_contains(area, mouse.column, mouse.row))
+				{
+					self.codex_chat.scroll_history(-3);
+				}
+			}
+			MouseEventKind::ScrollDown => {
+				if self
+					.codex_change_list_area
+					.is_some_and(|area| rect_contains(area, mouse.column, mouse.row))
+				{
+					self.codex_chat.scroll_change_list(3);
+				} else if self
+					.codex_history_area
+					.is_some_and(|area| rect_contains(area, mouse.column, mouse.row))
+				{
+					self.codex_chat.scroll_history(3);
+				}
+			}
+			_ => {}
+		}
+
+		AppAction::Continue
 	}
 
 	fn handle_key(&mut self, key: KeyEvent) -> AppAction {
@@ -758,6 +799,30 @@ impl App {
 				if let Err(error) = self.undo_last_codex_change() {
 					self.status_message = format!("undo failed: {error}");
 				}
+				AppAction::Continue
+			}
+			KeyCode::Up => {
+				self.codex_chat.scroll_history(-1);
+				AppAction::Continue
+			}
+			KeyCode::Down => {
+				self.codex_chat.scroll_history(1);
+				AppAction::Continue
+			}
+			KeyCode::PageUp => {
+				self.codex_chat.scroll_history(-6);
+				AppAction::Continue
+			}
+			KeyCode::PageDown => {
+				self.codex_chat.scroll_history(6);
+				AppAction::Continue
+			}
+			KeyCode::Home => {
+				self.codex_chat.history_scroll = 0;
+				AppAction::Continue
+			}
+			KeyCode::End => {
+				self.codex_chat.history_scroll = usize::MAX;
 				AppAction::Continue
 			}
 			KeyCode::Backspace => {
@@ -1095,6 +1160,7 @@ impl App {
 			self.codex_chat.messages.clear();
 			self.codex_chat.input.clear();
 			self.codex_chat.clear_change_set();
+			self.codex_chat.history_scroll = 0;
 			self.codex_chat.push_assistant(
 				"chat cleared. ask about the selected project and i will keep that path as the working context.",
 			);
@@ -1116,6 +1182,7 @@ impl App {
 		self.pending_codex_request = Some(request_id);
 		self.codex_chat.push_pending(request_id);
 		self.codex_chat.input.clear();
+		self.codex_chat.history_scroll = usize::MAX;
 		self.status_message = format!("sending codex request for {working_label}");
 
 		let tx = self.codex_tx.clone();
@@ -1165,6 +1232,7 @@ impl App {
 					self.codex_chat
 						.resolve_pending(result.request_id, response.reply);
 					self.codex_chat.set_change_set(response.change_set);
+					self.codex_chat.history_scroll = usize::MAX;
 					self.refresh_after_codex_reply();
 					self.status_message = changed_files
 						.map(|count| match count {
@@ -1446,6 +1514,8 @@ impl CodexChat {
 			messages: Vec::new(),
 			input: String::new(),
 			last_change_set: None,
+			history_scroll: 0,
+			change_scroll: 0,
 		};
 		chat.push_assistant(&format!(
 			"minimal codex chat ready.\nworking project: {working_label}\nask something here and i will keep the selected project as context."
@@ -1477,6 +1547,8 @@ impl CodexChat {
 		};
 		let working_label = relative_to_root(root, working_project);
 		self.last_change_set = None;
+		self.history_scroll = usize::MAX;
+		self.change_scroll = 0;
 		self.push_assistant(&format!("switched project context to {working_label}."));
 	}
 
@@ -1512,10 +1584,20 @@ impl CodexChat {
 
 	fn set_change_set(&mut self, change_set: Option<CodexChangeSet>) {
 		self.last_change_set = change_set;
+		self.change_scroll = 0;
 	}
 
 	fn clear_change_set(&mut self) {
 		self.last_change_set = None;
+		self.change_scroll = 0;
+	}
+
+	fn scroll_history(&mut self, delta: isize) {
+		self.history_scroll = self.history_scroll.saturating_add_signed(delta);
+	}
+
+	fn scroll_change_list(&mut self, delta: isize) {
+		self.change_scroll = self.change_scroll.saturating_add_signed(delta);
 	}
 }
 
@@ -2808,10 +2890,12 @@ fn performance_block(frame: &mut Frame, area: Rect, app: &App) {
 	frame.render_widget(spark, spark_area);
 }
 
-fn codex_block(frame: &mut Frame, area: Rect, app: &App) {
+fn codex_block(frame: &mut Frame, area: Rect, app: &mut App) {
 	let block = panel("codex", app.ui, app.focus == Focus::Codex);
 	let inner = block.inner(area);
 	frame.render_widget(block, area);
+	app.codex_history_area = None;
+	app.codex_change_list_area = None;
 
 	if inner.width == 0 || inner.height == 0 {
 		return;
@@ -2839,12 +2923,17 @@ fn codex_block(frame: &mut Frame, area: Rect, app: &App) {
 	};
 
 	if let (Some(change_set), Some(change_area)) = (&app.codex_chat.last_change_set, change_area) {
-		render_codex_change_block(frame, change_area, app, change_set);
+		app.codex_change_list_area = render_codex_change_block(frame, change_area, app, change_set);
 	}
 
 	if let Some(history_area) = history_area {
-		let history = Paragraph::new(codex_history_lines(app, history_area.width))
+		let history_lines = codex_history_lines(app, history_area.width);
+		let scroll = clamp_scroll(app.codex_chat.history_scroll, history_lines.len(), history_area.height);
+		app.codex_chat.history_scroll = scroll;
+		app.codex_history_area = Some(history_area);
+		let history = Paragraph::new(history_lines)
 			.style(Style::default().bg(app.ui.panel).fg(app.ui.text))
+			.scroll((scroll as u16, 0))
 			.wrap(Wrap { trim: false });
 		frame.render_widget(history, history_area);
 	}
@@ -2931,10 +3020,7 @@ fn codex_history_lines(app: &App, width: u16) -> Vec<Line<'static>> {
 			Span::styled(content, Style::default().fg(app.ui.text)),
 		]));
 	}
-
-	let max_lines = lines.len().min(8);
-	let start = lines.len().saturating_sub(max_lines);
-	lines[start..].to_vec()
+	lines
 }
 
 fn codex_change_block_height(change_set: &CodexChangeSet, available_height: u16) -> u16 {
@@ -2947,76 +3033,139 @@ fn render_codex_change_block(
 	area: Rect,
 	app: &App,
 	change_set: &CodexChangeSet,
-) {
-	let title = if change_set.reverse_patch.is_some() {
-		" changes  ctrl+z undo "
-	} else {
-		" changes "
-	};
+) -> Option<Rect> {
 	let block = Block::bordered()
 		.border_style(Style::default().fg(app.ui.border))
 		.style(Style::default().bg(app.ui.panel_alt))
 		.title(Line::styled(
-			title,
+			" changes ",
 			Style::default().fg(app.ui.accent).add_modifier(Modifier::BOLD),
 		));
 	let inner = block.inner(area);
 	frame.render_widget(block, area);
 
 	if inner.width == 0 || inner.height == 0 {
-		return;
+		return None;
 	}
 
-	let mut lines = Vec::new();
 	let count = change_set.files.len();
 	let summary = match count {
 		0 => "no files changed".to_string(),
 		1 => "1 file changed".to_string(),
 		_ => format!("{count} files changed"),
 	};
-	lines.push(Line::styled(
-		summary,
-		Style::default().fg(app.ui.text).add_modifier(Modifier::BOLD),
-	));
+	let (header_area, list_area) = if inner.height > 2 {
+		let [header_area, list_area] = Layout::default()
+			.direction(Direction::Vertical)
+			.constraints([Constraint::Length(1), Constraint::Min(1)])
+			.areas(inner);
+		(header_area, Some(list_area))
+	} else {
+		(inner, None)
+	};
 
-	let reserve_more_line = usize::from(change_set.files.len() > inner.height.saturating_sub(1) as usize);
-	let visible_files = inner
-		.height
-		.saturating_sub(1 + reserve_more_line as u16) as usize;
-	for file in change_set.files.iter().take(visible_files) {
-		let mut spans = vec![Span::styled(
-			relative_to_root(&app.project_tree.root, &file.path),
-			Style::default().fg(app.ui.text),
-		)];
-		if file.additions > 0 || file.deletions > 0 {
-			spans.push(Span::raw("  "));
-			if file.additions > 0 {
-				spans.push(Span::styled(
-					format!("+{}", file.additions),
-					Style::default().fg(app.ui.ansi[2]).add_modifier(Modifier::BOLD),
-				));
-			}
-			if file.deletions > 0 {
-				if file.additions > 0 {
-					spans.push(Span::raw(" "));
-				}
-				spans.push(Span::styled(
-					format!("-{}", file.deletions),
-					Style::default().fg(app.ui.ansi[1]).add_modifier(Modifier::BOLD),
-				));
-			}
+	let undo_label = if change_set.reverse_patch.is_some() {
+		"ctrl+z undo"
+	} else {
+		"undo unavailable"
+	};
+	let header = Paragraph::new(codex_change_header_line(
+		&summary,
+		undo_label,
+		header_area.width,
+		app.ui,
+	))
+	.style(Style::default().bg(app.ui.panel_alt));
+	frame.render_widget(header, header_area);
+
+	let Some(list_area) = list_area else {
+		return None;
+	};
+	if list_area.width == 0 || list_area.height == 0 {
+		return None;
+	}
+
+	let file_lines = change_set
+		.files
+		.iter()
+		.map(|file| codex_changed_file_line(app, file, list_area.width))
+		.collect::<Vec<_>>();
+	let scroll = clamp_scroll(app.codex_chat.change_scroll, file_lines.len(), list_area.height);
+	let list = Paragraph::new(file_lines)
+		.style(Style::default().bg(app.ui.panel_alt))
+		.scroll((scroll as u16, 0))
+		.wrap(Wrap { trim: false });
+	frame.render_widget(list, list_area);
+	Some(list_area)
+}
+
+fn codex_change_header_line(summary: &str, action: &str, width: u16, ui: UiTheme) -> Line<'static> {
+	let summary_len = summary.chars().count();
+	let action_len = action.chars().count();
+	let spacing = (width as usize)
+		.saturating_sub(summary_len)
+		.saturating_sub(action_len)
+		.max(2);
+	Line::from(vec![
+		Span::styled(
+			summary.to_string(),
+			Style::default().fg(ui.text).add_modifier(Modifier::BOLD),
+		),
+		Span::raw(" ".repeat(spacing)),
+		Span::styled(
+			action.to_string(),
+			Style::default().fg(ui.accent).add_modifier(Modifier::BOLD),
+		),
+	])
+}
+
+fn codex_changed_file_line(app: &App, file: &CodexChangedFile, width: u16) -> Line<'static> {
+	let relative = relative_to_root(&app.project_tree.root, &file.path);
+	let mut stats = String::new();
+	if file.additions > 0 {
+		stats.push_str(&format!("+{}", file.additions));
+	}
+	if file.deletions > 0 {
+		if !stats.is_empty() {
+			stats.push(' ');
 		}
-		lines.push(Line::from(spans));
+		stats.push_str(&format!("-{}", file.deletions));
 	}
-	if change_set.files.len() > visible_files {
-		lines.push(Line::styled(
-			format!("+{} more", change_set.files.len() - visible_files),
-			Style::default().fg(app.ui.muted),
-		));
+	let max_path = (width as usize)
+		.saturating_sub(stats.chars().count())
+		.saturating_sub(6)
+		.max(8);
+	let truncated = truncate_with_ellipsis(&relative, max_path);
+	let spacing = (width as usize)
+		.saturating_sub(truncated.chars().count())
+		.saturating_sub(stats.chars().count())
+		.saturating_sub(2)
+		.max(1);
+
+	let mut spans = vec![
+		Span::styled("󰈔 ", Style::default().fg(app.ui.accent)),
+		Span::styled(truncated, Style::default().fg(app.ui.text)),
+	];
+	if !stats.is_empty() {
+		spans.push(Span::raw(" ".repeat(spacing)));
+		if file.additions > 0 {
+			spans.push(Span::styled(
+				format!("+{}", file.additions),
+				Style::default().fg(app.ui.ansi[2]).add_modifier(Modifier::BOLD),
+			));
+		}
+		if file.deletions > 0 {
+			if file.additions > 0 {
+				spans.push(Span::raw(" "));
+			}
+			spans.push(Span::styled(
+				format!("-{}", file.deletions),
+				Style::default().fg(app.ui.ansi[1]).add_modifier(Modifier::BOLD),
+			));
+		}
 	}
 
-	let widget = Paragraph::new(lines).wrap(Wrap { trim: false });
-	frame.render_widget(widget, inner);
+	Line::from(spans)
 }
 
 fn panel<'a>(title: &'a str, ui: UiTheme, focused: bool) -> Block<'a> {
@@ -3327,6 +3476,31 @@ fn relative_to_root(root: &Path, path: &Path) -> String {
 		Ok(relative) => relative.display().to_string(),
 		Err(_) => path.display().to_string(),
 	}
+}
+
+fn rect_contains(area: Rect, x: u16, y: u16) -> bool {
+	x >= area.x && x < area.right() && y >= area.y && y < area.bottom()
+}
+
+fn clamp_scroll(scroll: usize, total_lines: usize, viewport_height: u16) -> usize {
+	let visible = viewport_height as usize;
+	if visible == 0 || total_lines <= visible {
+		return 0;
+	}
+	scroll.min(total_lines.saturating_sub(visible))
+}
+
+fn truncate_with_ellipsis(text: &str, max_chars: usize) -> String {
+	if text.chars().count() <= max_chars {
+		return text.to_string();
+	}
+	if max_chars <= 1 {
+		return "…".to_string();
+	}
+	let keep = max_chars.saturating_sub(1);
+	let mut output = text.chars().take(keep).collect::<String>();
+	output.push('…');
+	output
 }
 
 fn project_picker_entries(root: &Path) -> io::Result<Vec<ProjectPickerEntry>> {
