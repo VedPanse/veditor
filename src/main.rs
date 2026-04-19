@@ -210,12 +210,27 @@ struct ProjectPickerEntry {
 struct CodexChat {
 	messages: Vec<ChatMessage>,
 	input: String,
+	last_change_set: Option<CodexChangeSet>,
 }
 
 struct ChatMessage {
 	role: ChatRole,
 	content: String,
 	pending_request_id: Option<u64>,
+}
+
+#[derive(Clone)]
+struct CodexChangeSet {
+	working_root: PathBuf,
+	files: Vec<CodexChangedFile>,
+	reverse_patch: Option<String>,
+}
+
+#[derive(Clone)]
+struct CodexChangedFile {
+	path: PathBuf,
+	additions: usize,
+	deletions: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -268,7 +283,7 @@ enum ProjectPickerSearchUpdate {
 
 struct CodexResult {
 	request_id: u64,
-	reply: Result<String, String>,
+	reply: Result<CodexResponse, String>,
 }
 
 struct SessionState {
@@ -281,6 +296,22 @@ struct SessionState {
 struct NvimBufferState {
 	files: Vec<PathBuf>,
 	current: Option<PathBuf>,
+}
+
+struct CodexResponse {
+	reply: String,
+	change_set: Option<CodexChangeSet>,
+}
+
+struct CodexExecResponse {
+	reply: String,
+	turn_diff: Option<String>,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct WorkspaceFileState {
+	len: u64,
+	modified_ms: Option<u128>,
 }
 
 impl App {
@@ -723,6 +754,12 @@ impl App {
 				self.submit_codex_prompt();
 				AppAction::Continue
 			}
+			KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+				if let Err(error) = self.undo_last_codex_change() {
+					self.status_message = format!("undo failed: {error}");
+				}
+				AppAction::Continue
+			}
 			KeyCode::Backspace => {
 				self.codex_chat.input.pop();
 				AppAction::Continue
@@ -1057,6 +1094,7 @@ impl App {
 		if prompt == "/clear" {
 			self.codex_chat.messages.clear();
 			self.codex_chat.input.clear();
+			self.codex_chat.clear_change_set();
 			self.codex_chat.push_assistant(
 				"chat cleared. ask about the selected project and i will keep that path as the working context.",
 			);
@@ -1081,8 +1119,23 @@ impl App {
 		self.status_message = format!("sending codex request for {working_label}");
 
 		let tx = self.codex_tx.clone();
+		let project_root = self.project_tree.root.clone();
 		thread::spawn(move || {
-			let reply = request_codex_reply(&working_project, &transcript);
+			let before_manifest = capture_workspace_manifest(&working_project).ok();
+			let reply = request_codex_reply(&working_project, &transcript).map(|response| {
+				let change_set = before_manifest.as_ref().and_then(|before_manifest| {
+					build_codex_change_set(
+						&project_root,
+						&working_project,
+						before_manifest,
+						response.turn_diff.as_deref(),
+					)
+				});
+				CodexResponse {
+					reply: response.reply,
+					change_set,
+				}
+			});
 			let _ = tx.send(CodexResult { request_id, reply });
 		});
 	}
@@ -1107,9 +1160,19 @@ impl App {
 		while let Ok(result) = self.codex_rx.try_recv() {
 			self.pending_codex_request = self.pending_codex_request.filter(|id| *id != result.request_id);
 			match result.reply {
-				Ok(reply) => {
-					self.codex_chat.resolve_pending(result.request_id, reply);
-					self.status_message = "codex replied".to_string();
+				Ok(response) => {
+					let changed_files = response.change_set.as_ref().map(|change_set| change_set.files.len());
+					self.codex_chat
+						.resolve_pending(result.request_id, response.reply);
+					self.codex_chat.set_change_set(response.change_set);
+					self.refresh_after_codex_reply();
+					self.status_message = changed_files
+						.map(|count| match count {
+							0 => "codex replied".to_string(),
+							1 => "codex replied and changed 1 file".to_string(),
+							_ => format!("codex replied and changed {count} files"),
+						})
+						.unwrap_or_else(|| "codex replied".to_string());
 				}
 				Err(error) => {
 					self.codex_chat.resolve_pending(
@@ -1120,6 +1183,85 @@ impl App {
 				}
 			}
 		}
+	}
+
+	fn refresh_after_codex_reply(&mut self) {
+		let selected_path = self
+			.project_tree
+			.visible
+			.get(self.project_tree.selected)
+			.map(|entry| entry.path.clone())
+			.filter(|path| path.exists())
+			.or_else(|| self.active_file.clone().filter(|path| path.exists()))
+			.or_else(|| Some(self.project_tree.root.clone()));
+		self.project_tree.refresh(selected_path);
+
+		if let Some(active_file) = self.active_file.clone() {
+			if uses_editor_preview(&active_file) {
+				if active_file.exists() {
+					if let Ok(preview) = load_editor_preview(active_file.clone()) {
+						self.editor_preview = Some(preview);
+					}
+				} else {
+					self.editor_preview = None;
+					self.active_file = None;
+				}
+			} else if !self.nvim.is_exited() {
+				let _ = self.nvim.checktime();
+			}
+		} else if !self.nvim.is_exited() {
+			let _ = self.nvim.checktime();
+		}
+
+		let _ = self.persist_session_state(false);
+	}
+
+	fn undo_last_codex_change(&mut self) -> io::Result<()> {
+		if self.pending_codex_request.is_some() {
+			self.status_message = "wait for codex to finish before undo".to_string();
+			return Ok(());
+		}
+
+		let Some(change_set) = self.codex_chat.last_change_set.clone() else {
+			self.status_message = "no codex changes to undo".to_string();
+			return Ok(());
+		};
+		let Some(reverse_patch) = change_set.reverse_patch.clone() else {
+			self.status_message = "undo unavailable for last codex change".to_string();
+			return Ok(());
+		};
+
+		let patch_path = codex_undo_patch_path()?;
+		if let Some(parent) = patch_path.parent() {
+			fs::create_dir_all(parent)?;
+		}
+		fs::write(&patch_path, reverse_patch)?;
+
+		let output = Command::new("git")
+			.arg("apply")
+			.arg("-R")
+			.arg("--unsafe-paths")
+			.arg(&patch_path)
+			.current_dir(&change_set.working_root)
+			.output()?;
+		let _ = fs::remove_file(&patch_path);
+
+		if !output.status.success() {
+			let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+			let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+			let detail = if !stderr.is_empty() { stderr } else { stdout };
+			return Err(io_error(if detail.is_empty() {
+				format!("undo failed with status {}", output.status)
+			} else {
+				format!("undo failed: {detail}")
+			}));
+		}
+
+		self.codex_chat.clear_change_set();
+		self.codex_chat.push_assistant("undid the last codex change.");
+		self.refresh_after_codex_reply();
+		self.status_message = "undid last codex change".to_string();
+		Ok(())
 	}
 
 	fn restore_session_files(
@@ -1303,6 +1445,7 @@ impl CodexChat {
 		let mut chat = Self {
 			messages: Vec::new(),
 			input: String::new(),
+			last_change_set: None,
 		};
 		chat.push_assistant(&format!(
 			"minimal codex chat ready.\nworking project: {working_label}\nask something here and i will keep the selected project as context."
@@ -1333,6 +1476,7 @@ impl CodexChat {
 			selected_target.parent().unwrap_or(root)
 		};
 		let working_label = relative_to_root(root, working_project);
+		self.last_change_set = None;
 		self.push_assistant(&format!("switched project context to {working_label}."));
 	}
 
@@ -1366,6 +1510,13 @@ impl CodexChat {
 		lines.join("\n\n")
 	}
 
+	fn set_change_set(&mut self, change_set: Option<CodexChangeSet>) {
+		self.last_change_set = change_set;
+	}
+
+	fn clear_change_set(&mut self) {
+		self.last_change_set = None;
+	}
 }
 
 impl TerminalMetrics {
@@ -1538,6 +1689,11 @@ impl PtyPane {
 		let escaped = escape_nvim_path(path);
 		let command = format!("\x1b:drop {escaped}\r");
 		self.writer.write_all(command.as_bytes())?;
+		self.writer.flush()
+	}
+
+	fn checktime(&mut self) -> io::Result<()> {
+		self.writer.write_all(b"\x1b:checktime\r")?;
 		self.writer.flush()
 	}
 
@@ -2661,15 +2817,30 @@ fn codex_block(frame: &mut Frame, area: Rect, app: &App) {
 		return;
 	}
 
-	let (history_area, input_area) = if inner.height >= 6 {
+	let change_height = app
+		.codex_chat
+		.last_change_set
+		.as_ref()
+		.map(|change_set| codex_change_block_height(change_set, inner.height));
+	let (change_area, history_area, input_area) = if let Some(change_height) = change_height {
+		let [change_area, history_area, input_area] = Layout::default()
+			.direction(Direction::Vertical)
+			.constraints([Constraint::Length(change_height), Constraint::Min(1), Constraint::Length(3)])
+			.areas(inner);
+		(Some(change_area), Some(history_area), input_area)
+	} else if inner.height >= 6 {
 		let [history_area, input_area] = Layout::default()
 			.direction(Direction::Vertical)
 			.constraints([Constraint::Min(1), Constraint::Length(3)])
 			.areas(inner);
-		(Some(history_area), input_area)
+		(None, Some(history_area), input_area)
 	} else {
-		(None, inner)
+		(None, None, inner)
 	};
+
+	if let (Some(change_set), Some(change_area)) = (&app.codex_chat.last_change_set, change_area) {
+		render_codex_change_block(frame, change_area, app, change_set);
+	}
 
 	if let Some(history_area) = history_area {
 		let history = Paragraph::new(codex_history_lines(app, history_area.width))
@@ -2764,6 +2935,88 @@ fn codex_history_lines(app: &App, width: u16) -> Vec<Line<'static>> {
 	let max_lines = lines.len().min(8);
 	let start = lines.len().saturating_sub(max_lines);
 	lines[start..].to_vec()
+}
+
+fn codex_change_block_height(change_set: &CodexChangeSet, available_height: u16) -> u16 {
+	let desired = (change_set.files.len().min(4) as u16).saturating_add(3);
+	desired.min(available_height.saturating_sub(3)).max(3)
+}
+
+fn render_codex_change_block(
+	frame: &mut Frame,
+	area: Rect,
+	app: &App,
+	change_set: &CodexChangeSet,
+) {
+	let title = if change_set.reverse_patch.is_some() {
+		" changes  ctrl+z undo "
+	} else {
+		" changes "
+	};
+	let block = Block::bordered()
+		.border_style(Style::default().fg(app.ui.border))
+		.style(Style::default().bg(app.ui.panel_alt))
+		.title(Line::styled(
+			title,
+			Style::default().fg(app.ui.accent).add_modifier(Modifier::BOLD),
+		));
+	let inner = block.inner(area);
+	frame.render_widget(block, area);
+
+	if inner.width == 0 || inner.height == 0 {
+		return;
+	}
+
+	let mut lines = Vec::new();
+	let count = change_set.files.len();
+	let summary = match count {
+		0 => "no files changed".to_string(),
+		1 => "1 file changed".to_string(),
+		_ => format!("{count} files changed"),
+	};
+	lines.push(Line::styled(
+		summary,
+		Style::default().fg(app.ui.text).add_modifier(Modifier::BOLD),
+	));
+
+	let reserve_more_line = usize::from(change_set.files.len() > inner.height.saturating_sub(1) as usize);
+	let visible_files = inner
+		.height
+		.saturating_sub(1 + reserve_more_line as u16) as usize;
+	for file in change_set.files.iter().take(visible_files) {
+		let mut spans = vec![Span::styled(
+			relative_to_root(&app.project_tree.root, &file.path),
+			Style::default().fg(app.ui.text),
+		)];
+		if file.additions > 0 || file.deletions > 0 {
+			spans.push(Span::raw("  "));
+			if file.additions > 0 {
+				spans.push(Span::styled(
+					format!("+{}", file.additions),
+					Style::default().fg(app.ui.ansi[2]).add_modifier(Modifier::BOLD),
+				));
+			}
+			if file.deletions > 0 {
+				if file.additions > 0 {
+					spans.push(Span::raw(" "));
+				}
+				spans.push(Span::styled(
+					format!("-{}", file.deletions),
+					Style::default().fg(app.ui.ansi[1]).add_modifier(Modifier::BOLD),
+				));
+			}
+		}
+		lines.push(Line::from(spans));
+	}
+	if change_set.files.len() > visible_files {
+		lines.push(Line::styled(
+			format!("+{} more", change_set.files.len() - visible_files),
+			Style::default().fg(app.ui.muted),
+		));
+	}
+
+	let widget = Paragraph::new(lines).wrap(Wrap { trim: false });
+	frame.render_widget(widget, inner);
 }
 
 fn panel<'a>(title: &'a str, ui: UiTheme, focused: bool) -> Block<'a> {
@@ -3193,7 +3446,249 @@ fn find_first_project_root(dir: &Path) -> Option<PathBuf> {
 	None
 }
 
-fn request_codex_reply(working_project: &Path, transcript: &str) -> Result<String, String> {
+fn capture_workspace_manifest(root: &Path) -> io::Result<HashMap<PathBuf, WorkspaceFileState>> {
+	let mut manifest = HashMap::new();
+	collect_workspace_manifest(root, root, &mut manifest)?;
+	Ok(manifest)
+}
+
+fn collect_workspace_manifest(
+	root: &Path,
+	dir: &Path,
+	manifest: &mut HashMap<PathBuf, WorkspaceFileState>,
+) -> io::Result<()> {
+	let mut entries = fs::read_dir(dir)?.collect::<Result<Vec<_>, _>>()?;
+	entries.sort_by_key(|entry| entry.path());
+
+	for entry in entries {
+		let path = entry.path();
+		let Ok(metadata) = entry.metadata() else {
+			continue;
+		};
+		if metadata.is_dir() {
+			collect_workspace_manifest(root, &path, manifest)?;
+			continue;
+		}
+		if !metadata.is_file() {
+			continue;
+		}
+
+		let Ok(relative) = path.strip_prefix(root) else {
+			continue;
+		};
+		let modified_ms = metadata
+			.modified()
+			.ok()
+			.and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+			.map(|duration| duration.as_millis());
+		manifest.insert(
+			relative.to_path_buf(),
+			WorkspaceFileState {
+				len: metadata.len(),
+				modified_ms,
+			},
+		);
+	}
+
+	Ok(())
+}
+
+fn workspace_changed_paths(
+	before: &HashMap<PathBuf, WorkspaceFileState>,
+	after: &HashMap<PathBuf, WorkspaceFileState>,
+) -> Vec<PathBuf> {
+	let mut paths = before
+		.keys()
+		.chain(after.keys())
+		.cloned()
+		.collect::<BTreeSet<_>>()
+		.into_iter()
+		.filter(|path| before.get(path) != after.get(path))
+		.collect::<Vec<_>>();
+	paths.sort();
+	paths
+}
+
+fn build_codex_change_set(
+	project_root: &Path,
+	working_project: &Path,
+	before_manifest: &HashMap<PathBuf, WorkspaceFileState>,
+	turn_diff: Option<&str>,
+) -> Option<CodexChangeSet> {
+	let after_manifest = capture_workspace_manifest(working_project).ok()?;
+	let changed_paths = workspace_changed_paths(before_manifest, &after_manifest);
+	if changed_paths.is_empty() {
+		return None;
+	}
+
+	let reverse_patch = turn_diff
+		.and_then(|diff| normalize_codex_turn_diff(diff, working_project))
+		.filter(|diff| !diff.trim().is_empty());
+	let diff_stats = reverse_patch
+		.as_deref()
+		.map(|diff| parse_codex_diff_stats(diff, working_project))
+		.unwrap_or_default();
+	let mut files = changed_paths
+		.into_iter()
+		.map(|relative_path| {
+			let path = working_project.join(&relative_path);
+			let (additions, deletions) = diff_stats.get(&path).copied().unwrap_or((0, 0));
+			CodexChangedFile {
+				path,
+				additions,
+				deletions,
+			}
+		})
+		.collect::<Vec<_>>();
+	files.sort_by_key(|file| relative_to_root(project_root, &file.path));
+
+	Some(CodexChangeSet {
+		working_root: working_project.to_path_buf(),
+		files,
+		reverse_patch,
+	})
+}
+
+fn normalize_codex_turn_diff(diff: &str, working_project: &Path) -> Option<String> {
+	let mut normalized = Vec::new();
+	for line in diff.lines() {
+		if let Some(rest) = line.strip_prefix("diff --git ") {
+			let (left, right) = rest.split_once(' ')?;
+			let left = normalize_git_diff_side(left, working_project)?;
+			let right = normalize_git_diff_side(right, working_project)?;
+			normalized.push(format!("diff --git {left} {right}"));
+		} else if let Some(path) = line.strip_prefix("--- ") {
+			normalized.push(format!(
+				"--- {}",
+				normalize_diff_header_path(path, working_project)?
+			));
+		} else if let Some(path) = line.strip_prefix("+++ ") {
+			normalized.push(format!(
+				"+++ {}",
+				normalize_diff_header_path(path, working_project)?
+			));
+		} else {
+			normalized.push(line.to_string());
+		}
+	}
+
+	if normalized.is_empty() {
+		return None;
+	}
+
+	let mut text = normalized.join("\n");
+	text.push('\n');
+	Some(text)
+}
+
+fn normalize_git_diff_side(side: &str, working_project: &Path) -> Option<String> {
+	if let Some(path) = side.strip_prefix("a/") {
+		return Some(format!("a/{}", normalize_diff_path(path, working_project)?));
+	}
+	if let Some(path) = side.strip_prefix("b/") {
+		return Some(format!("b/{}", normalize_diff_path(path, working_project)?));
+	}
+	Some(normalize_diff_path(side, working_project)?)
+}
+
+fn normalize_diff_header_path(path: &str, working_project: &Path) -> Option<String> {
+	if path == "/dev/null" {
+		return Some(path.to_string());
+	}
+	if let Some(value) = path.strip_prefix("a/") {
+		return Some(format!("a/{}", normalize_diff_path(value, working_project)?));
+	}
+	if let Some(value) = path.strip_prefix("b/") {
+		return Some(format!("b/{}", normalize_diff_path(value, working_project)?));
+	}
+	Some(normalize_diff_path(path, working_project)?)
+}
+
+fn normalize_diff_path(path: &str, working_project: &Path) -> Option<String> {
+	let raw = path.trim();
+	if raw == "/dev/null" {
+		return Some(raw.to_string());
+	}
+	let candidate = PathBuf::from(raw);
+	if candidate.is_absolute() {
+		let relative = candidate.strip_prefix(working_project).ok()?;
+		return Some(relative.to_string_lossy().replace('\\', "/"));
+	}
+	Some(raw.trim_start_matches("./").to_string())
+}
+
+fn parse_codex_diff_stats(
+	diff: &str,
+	working_project: &Path,
+) -> HashMap<PathBuf, (usize, usize)> {
+	let mut stats = HashMap::new();
+	let mut current_path = None;
+
+	for line in diff.lines() {
+		if let Some(rest) = line.strip_prefix("diff --git a/") {
+			if let Some((_, new_path)) = rest.split_once(" b/") {
+				let path = working_project.join(new_path);
+				stats.entry(path.clone()).or_insert((0, 0));
+				current_path = Some(path);
+			}
+			continue;
+		}
+
+		if line.starts_with("+++") || line.starts_with("---") {
+			continue;
+		}
+
+		let Some(path) = current_path.as_ref() else {
+			continue;
+		};
+
+		if line.starts_with('+') {
+			if let Some((additions, _)) = stats.get_mut(path) {
+				*additions += 1;
+			}
+		} else if line.starts_with('-') {
+			if let Some((_, deletions)) = stats.get_mut(path) {
+				*deletions += 1;
+			}
+		}
+	}
+
+	stats
+}
+
+fn parse_codex_exec_stdout(stdout: &str) -> (Option<String>, Option<String>) {
+	let mut turn_diff = None;
+	let mut last_agent_message = None;
+
+	for line in stdout.lines() {
+		let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+			continue;
+		};
+		let Some(message) = value.get("msg") else {
+			continue;
+		};
+		let Some(kind) = message.get("type").and_then(serde_json::Value::as_str) else {
+			continue;
+		};
+		match kind {
+			"turn_diff" => {
+				if let Some(diff) = message.get("unified_diff").and_then(serde_json::Value::as_str) {
+					turn_diff = Some(diff.to_string());
+				}
+			}
+			"agent_message" => {
+				if let Some(text) = message.get("message").and_then(serde_json::Value::as_str) {
+					last_agent_message = Some(text.to_string());
+				}
+			}
+			_ => {}
+		}
+	}
+
+	(turn_diff, last_agent_message)
+}
+
+fn request_codex_reply(working_project: &Path, transcript: &str) -> Result<CodexExecResponse, String> {
 	let output_path = codex_last_message_path();
 	let prompt = format!(
 		"You are Codex embedded inside a terminal editor. The current working project is '{}'. Answer directly and concisely. When relevant, treat that path as the project root.\n\n{}",
@@ -3208,9 +3703,10 @@ fn request_codex_reply(working_project: &Path, transcript: &str) -> Result<Strin
 			working_project.to_str().unwrap_or("."),
 			"--skip-git-repo-check",
 			"--sandbox",
-			"read-only",
+			"workspace-write",
 			"--color",
 			"never",
+			"--json",
 			"--output-last-message",
 		])
 		.arg(&output_path)
@@ -3239,6 +3735,9 @@ fn request_codex_reply(working_project: &Path, transcript: &str) -> Result<Strin
 		.ok()
 		.map(|text| text.trim().to_string());
 	let _ = fs::remove_file(&output_path);
+	let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+	let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+	let (turn_diff, last_agent_message) = parse_codex_exec_stdout(&stdout);
 
 	if output.status.success() {
 		if let Some(message) = last_message
@@ -3246,22 +3745,47 @@ fn request_codex_reply(working_project: &Path, transcript: &str) -> Result<Strin
 			.filter(|message| !message.is_empty())
 			.cloned()
 		{
-			return Ok(message);
+			return Ok(CodexExecResponse {
+				reply: message,
+				turn_diff,
+			});
+		}
+		if let Some(message) = last_agent_message
+			.as_ref()
+			.filter(|message| !message.is_empty())
+			.cloned()
+		{
+			return Ok(CodexExecResponse {
+				reply: message,
+				turn_diff,
+			});
 		}
 	}
 
-	let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-	let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
 	if let Some(message) = last_message
 		.as_ref()
 		.filter(|message| !message.is_empty())
 		.cloned()
 	{
-		return Ok(message);
+		return Ok(CodexExecResponse {
+			reply: message,
+			turn_diff,
+		});
+	}
+	if let Some(message) = last_agent_message
+		.as_ref()
+		.filter(|message| !message.is_empty())
+		.cloned()
+	{
+		return Ok(CodexExecResponse {
+			reply: message,
+			turn_diff,
+		});
 	}
 	if !stderr.is_empty() {
 		return Err(stderr);
 	}
+	let stdout = stdout.trim().to_string();
 	if !stdout.is_empty() {
 		return Err(stdout);
 	}
@@ -3672,6 +4196,16 @@ fn codex_last_message_path() -> PathBuf {
 		.unwrap_or_default()
 		.as_millis();
 	env::temp_dir().join(format!("veditor-codex-last-message-{stamp}.txt"))
+}
+
+fn codex_undo_patch_path() -> io::Result<PathBuf> {
+	let Some(path) = session_state_path() else {
+		return Err(io_error("session path unavailable"));
+	};
+	let parent = path
+		.parent()
+		.ok_or_else(|| io_error("session directory unavailable"))?;
+	Ok(parent.join("codex-undo.patch"))
 }
 
 fn nvim_theme_lua(ui: UiTheme) -> String {
