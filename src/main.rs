@@ -3,13 +3,13 @@ use std::{
 	env, fs,
 	io::{self, Read, Write},
 	path::{Path, PathBuf},
-	process::Command,
+	process::{Command, Stdio},
 	sync::{
 		mpsc::{self, Receiver, Sender},
 		Arc, Mutex,
 	},
 	thread,
-	time::{Duration, Instant},
+	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -95,7 +95,6 @@ struct App {
 	ui: UiTheme,
 	project_tree: ProjectTree,
 	codex_chat: CodexChat,
-	codex_api_key: String,
 	codex_tx: Sender<CodexResult>,
 	codex_rx: Receiver<CodexResult>,
 	next_codex_request_id: u64,
@@ -337,8 +336,6 @@ impl App {
 		project_tree.expand_to(&startup_target);
 		project_tree.select_path(&startup_target);
 		let (codex_tx, codex_rx) = mpsc::channel();
-		let codex_api_key =
-			load_codex_pi_key(&root).unwrap_or_else(|| "render-it-here".to_string());
 		let mut app = Self {
 			terminal_metrics: TerminalMetrics::new(None),
 			focus: Focus::Editor,
@@ -346,7 +343,6 @@ impl App {
 			ui,
 			project_tree,
 			codex_chat: CodexChat::new(&root, &startup_target),
-			codex_api_key,
 			codex_tx,
 			codex_rx,
 			next_codex_request_id: 1,
@@ -1035,7 +1031,6 @@ impl App {
 			.then(|| load_editor_preview(target.clone()))
 			.transpose()?;
 		self.project_tree = project_tree;
-		self.codex_api_key = load_codex_pi_key(&root).unwrap_or_else(|| "render-it-here".to_string());
 		self.codex_chat.switch_project(&root, &target);
 		self.terminal_metrics = TerminalMetrics::new(self.terminal.process_id());
 		self.refresh_terminal_metrics(true);
@@ -1085,10 +1080,9 @@ impl App {
 		self.codex_chat.input.clear();
 		self.status_message = format!("sending codex request for {working_label}");
 
-		let api_key = self.codex_api_key.clone();
 		let tx = self.codex_tx.clone();
 		thread::spawn(move || {
-			let reply = request_codex_reply(&api_key, &working_project, &transcript);
+			let reply = request_codex_reply(&working_project, &transcript);
 			let _ = tx.send(CodexResult { request_id, reply });
 		});
 	}
@@ -2194,7 +2188,7 @@ fn render(frame: &mut Frame, app: &mut App) {
 
 	let [editor_area, codex_area] = Layout::default()
 		.direction(Direction::Vertical)
-		.constraints([Constraint::Min(12), Constraint::Length(5)])
+		.constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
 		.areas(right);
 
 	render_pty_pane(frame, terminal_area, app.ui, app.focus == Focus::Terminal, &mut app.terminal);
@@ -2667,6 +2661,23 @@ fn codex_block(frame: &mut Frame, area: Rect, app: &App) {
 		return;
 	}
 
+	let (history_area, input_area) = if inner.height >= 6 {
+		let [history_area, input_area] = Layout::default()
+			.direction(Direction::Vertical)
+			.constraints([Constraint::Min(1), Constraint::Length(3)])
+			.areas(inner);
+		(Some(history_area), input_area)
+	} else {
+		(None, inner)
+	};
+
+	if let Some(history_area) = history_area {
+		let history = Paragraph::new(codex_history_lines(app, history_area.width))
+			.style(Style::default().bg(app.ui.panel).fg(app.ui.text))
+			.wrap(Wrap { trim: false });
+		frame.render_widget(history, history_area);
+	}
+
 	let input_lines = if let Some(prompt) = &app.create_prompt {
 		vec![
 			Line::from(vec![
@@ -2700,11 +2711,11 @@ fn codex_block(frame: &mut Frame, area: Rect, app: &App) {
 			" chat ",
 			Style::default().fg(app.ui.accent).add_modifier(Modifier::BOLD),
 		));
-	let input_inner = input_block.inner(inner);
+	let input_inner = input_block.inner(input_area);
 	let input = Paragraph::new(input_lines)
 		.block(input_block)
 		.wrap(Wrap { trim: false });
-	frame.render_widget(input, inner);
+	frame.render_widget(input, input_area);
 
 	let (cursor_prefix, cursor_len) = if let Some(prompt) = &app.create_prompt {
 		(
@@ -2727,6 +2738,32 @@ fn codex_block(frame: &mut Frame, area: Rect, app: &App) {
 			frame.set_cursor_position((cursor_x, cursor_y));
 		}
 	}
+}
+
+fn codex_history_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+	if width == 0 {
+		return Vec::new();
+	}
+
+	let mut lines = Vec::new();
+	for message in &app.codex_chat.messages {
+		let label = match message.role {
+			ChatRole::User => "you",
+			ChatRole::Assistant => "codex",
+		};
+		let content = message.content.replace('\n', " ");
+		lines.push(Line::from(vec![
+			Span::styled(
+				format!("{label}  "),
+				Style::default().fg(app.ui.accent).add_modifier(Modifier::BOLD),
+			),
+			Span::styled(content, Style::default().fg(app.ui.text)),
+		]));
+	}
+
+	let max_lines = lines.len().min(8);
+	let start = lines.len().saturating_sub(max_lines);
+	lines[start..].to_vec()
 }
 
 fn panel<'a>(title: &'a str, ui: UiTheme, focused: bool) -> Block<'a> {
@@ -3031,27 +3068,6 @@ fn find_first_project_file(dir: &Path) -> Option<PathBuf> {
 	None
 }
 
-fn load_codex_pi_key(root: &Path) -> Option<String> {
-	let env_path = root.join(".env");
-	let contents = fs::read_to_string(env_path).ok()?;
-
-	for line in contents.lines() {
-		let trimmed = line.trim();
-		if trimmed.is_empty() || trimmed.starts_with('#') {
-			continue;
-		}
-
-		let Some((key, value)) = trimmed.split_once('=') else {
-			continue;
-		};
-		if key.trim() == "CODEX_PI_KEY" {
-			return Some(value.trim().trim_matches('"').to_string());
-		}
-	}
-
-	None
-}
-
 fn relative_to_root(root: &Path, path: &Path) -> String {
 	match path.strip_prefix(root) {
 		Ok(relative) if relative.as_os_str().is_empty() => ".".to_string(),
@@ -3177,74 +3193,79 @@ fn find_first_project_root(dir: &Path) -> Option<PathBuf> {
 	None
 }
 
-fn request_codex_reply(api_key: &str, working_project: &Path, transcript: &str) -> Result<String, String> {
-	let client = reqwest::blocking::Client::builder()
-		.timeout(Duration::from_secs(90))
-		.build()
-		.map_err(|error| error.to_string())?;
+fn request_codex_reply(working_project: &Path, transcript: &str) -> Result<String, String> {
+	let output_path = codex_last_message_path();
+	let prompt = format!(
+		"You are Codex embedded inside a terminal editor. The current working project is '{}'. Answer directly and concisely. When relevant, treat that path as the project root.\n\n{}",
+		working_project.display(),
+		transcript
+	);
 
-	let response = client
-		.post("https://api.openai.com/v1/responses")
-		.bearer_auth(api_key)
-		.json(&serde_json::json!({
-			"model": "gpt-5.1",
-			"instructions": format!(
-				"You are Codex embedded inside a terminal editor. The current working project is '{}'. Answer directly and concisely. When relevant, treat that path as the project root.",
-				working_project.display()
-			),
-			"input": transcript,
-		}))
-		.send()
-		.map_err(|error| error.to_string())?;
-
-	let status = response.status();
-	let body: serde_json::Value = response.json().map_err(|error| error.to_string())?;
-	if !status.is_success() {
-		let message = body
-			.get("error")
-			.and_then(|error| error.get("message"))
-			.and_then(serde_json::Value::as_str)
-			.unwrap_or("request failed");
-		return Err(format!("{status}: {message}"));
-	}
-
-	extract_response_text(&body).ok_or_else(|| "response did not include text output".to_string())
-}
-
-fn extract_response_text(body: &serde_json::Value) -> Option<String> {
-	if let Some(text) = body.get("output_text").and_then(serde_json::Value::as_str) {
-		let trimmed = text.trim();
-		if !trimmed.is_empty() {
-			return Some(trimmed.to_string());
-		}
-	}
-
-	let output = body.get("output")?.as_array()?;
-	let mut parts = Vec::new();
-	for item in output {
-		let Some(contents) = item.get("content").and_then(serde_json::Value::as_array) else {
-			continue;
-		};
-
-		for content in contents {
-			let text = content
-				.get("text")
-				.and_then(serde_json::Value::as_str)
-				.or_else(|| content.get("output_text").and_then(serde_json::Value::as_str));
-			if let Some(text) = text {
-				let trimmed = text.trim();
-				if !trimmed.is_empty() {
-					parts.push(trimmed.to_string());
-				}
+	let mut child = Command::new("codex")
+		.args([
+			"exec",
+			"--cd",
+			working_project.to_str().unwrap_or("."),
+			"--skip-git-repo-check",
+			"--sandbox",
+			"read-only",
+			"--color",
+			"never",
+			"--output-last-message",
+		])
+		.arg(&output_path)
+		.arg("-")
+		.stdin(Stdio::piped())
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.spawn()
+		.map_err(|error| {
+			if error.kind() == io::ErrorKind::NotFound {
+				"codex cli not found in PATH".to_string()
+			} else {
+				error.to_string()
 			}
+		})?;
+
+	if let Some(mut stdin) = child.stdin.take() {
+		stdin
+			.write_all(prompt.as_bytes())
+			.and_then(|_| stdin.flush())
+			.map_err(|error| error.to_string())?;
+	}
+
+	let output = child.wait_with_output().map_err(|error| error.to_string())?;
+	let last_message = fs::read_to_string(&output_path)
+		.ok()
+		.map(|text| text.trim().to_string());
+	let _ = fs::remove_file(&output_path);
+
+	if output.status.success() {
+		if let Some(message) = last_message
+			.as_ref()
+			.filter(|message| !message.is_empty())
+			.cloned()
+		{
+			return Ok(message);
 		}
 	}
 
-	if parts.is_empty() {
-		None
-	} else {
-		Some(parts.join("\n\n"))
+	let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+	let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+	if let Some(message) = last_message
+		.as_ref()
+		.filter(|message| !message.is_empty())
+		.cloned()
+	{
+		return Ok(message);
 	}
+	if !stderr.is_empty() {
+		return Err(stderr);
+	}
+	if !stdout.is_empty() {
+		return Err(stdout);
+	}
+	Err(format!("codex exec failed with status {}", output.status))
 }
 
 fn sample_terminal_process_tree(root_pid: u32) -> io::Result<TerminalProcessSample> {
@@ -3643,6 +3664,14 @@ fn notebook_text_plain_lines(value: Option<&serde_json::Value>) -> Vec<String> {
 			.collect(),
 		_ => Vec::new(),
 	}
+}
+
+fn codex_last_message_path() -> PathBuf {
+	let stamp = SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.unwrap_or_default()
+		.as_millis();
+	env::temp_dir().join(format!("veditor-codex-last-message-{stamp}.txt"))
 }
 
 fn nvim_theme_lua(ui: UiTheme) -> String {
