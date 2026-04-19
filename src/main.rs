@@ -1,5 +1,6 @@
 use std::{
-	fs,
+	collections::BTreeSet,
+	env, fs,
 	io::{self, Read, Write},
 	path::{Path, PathBuf},
 	sync::{Arc, Mutex},
@@ -8,7 +9,7 @@ use std::{
 };
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use ratatui::{
 	layout::{Constraint, Direction, Layout, Rect},
 	prelude::*,
@@ -73,39 +74,67 @@ struct UiTheme {
 struct App {
 	focus: Focus,
 	status_message: String,
-	project_entries: Vec<String>,
 	ui: UiTheme,
-	nvim: NvimPane,
+	project_tree: ProjectTree,
+	nvim: PtyPane,
+	terminal: PtyPane,
 }
 
-struct NvimPane {
-	file_path: PathBuf,
+struct PtyPane {
+	title: &'static str,
 	parser: Arc<Mutex<Parser>>,
 	writer: Box<dyn Write + Send>,
-	master: Box<dyn portable_pty::MasterPty + Send>,
-	child: Box<dyn portable_pty::Child + Send + Sync>,
+	master: Box<dyn MasterPty + Send>,
+	child: Box<dyn Child + Send + Sync>,
 	last_size: (u16, u16),
 	exit_status: Option<String>,
 }
 
-struct NvimSnapshot {
+struct PtySnapshot {
 	lines: Vec<Line<'static>>,
 	cursor: Option<(u16, u16)>,
 }
 
+struct ProjectTree {
+	root: PathBuf,
+	expanded: BTreeSet<PathBuf>,
+	visible: Vec<TreeEntry>,
+	selected: usize,
+}
+
+#[derive(Clone)]
+struct TreeEntry {
+	path: PathBuf,
+	depth: usize,
+	is_dir: bool,
+}
+
+enum TreeAction {
+	OpenFile(PathBuf),
+	ToggleDir,
+}
+
 impl App {
 	fn new(file_path: PathBuf) -> io::Result<Self> {
+		let root = env::current_dir()?;
+		let mut project_tree = ProjectTree::new(root.clone());
+		project_tree.select_path(&file_path);
+
 		Ok(Self {
 			focus: Focus::Editor,
-			status_message: "embedded nvim ready".to_string(),
-			project_entries: collect_project_entries(Path::new(".")),
+			status_message: "embedded nvim + terminal ready".to_string(),
 			ui: ui_theme(),
-			nvim: NvimPane::new(file_path)?,
+			project_tree,
+			nvim: PtyPane::spawn_nvim(file_path)?,
+			terminal: PtyPane::spawn_shell(root)?,
 		})
 	}
 
 	fn tick(&mut self) {
 		if let Some(status) = self.nvim.poll_exit() {
+			self.status_message = status;
+		}
+		if let Some(status) = self.terminal.poll_exit() {
 			self.status_message = status;
 		}
 	}
@@ -114,10 +143,18 @@ impl App {
 		match event {
 			Event::Key(key) if is_key_press(key.kind) => self.handle_key(key),
 			Event::Paste(text) => {
-				if self.focus == Focus::Editor {
-					if let Err(error) = self.nvim.send_paste(&text) {
-						self.status_message = format!("paste failed: {error}");
+				match self.focus {
+					Focus::Editor => {
+						if let Err(error) = self.nvim.send_paste(&text) {
+							self.status_message = format!("nvim paste failed: {error}");
+						}
 					}
+					Focus::Terminal => {
+						if let Err(error) = self.terminal.send_paste(&text) {
+							self.status_message = format!("terminal paste failed: {error}");
+						}
+					}
+					_ => {}
 				}
 				AppAction::Continue
 			}
@@ -135,21 +172,65 @@ impl App {
 			return AppAction::Continue;
 		}
 
-		if self.focus == Focus::Editor {
-			match self.nvim.send_key(key) {
-				Ok(()) => {}
-				Err(error) => {
-					self.status_message = format!("nvim input failed: {error}");
+		match self.focus {
+			Focus::Editor => self.forward_key_to_pane(key, true),
+			Focus::Terminal => self.forward_key_to_pane(key, false),
+			Focus::ProjectTree => self.handle_project_tree_key(key),
+			Focus::Performance | Focus::Codex => {
+				if key.code == KeyCode::Esc {
+					AppAction::Quit
+				} else {
+					AppAction::Continue
 				}
 			}
-			return AppAction::Continue;
 		}
+	}
 
-		if key.code == KeyCode::Esc {
-			return AppAction::Quit;
+	fn forward_key_to_pane(&mut self, key: KeyEvent, editor: bool) -> AppAction {
+		let result = if editor {
+			self.nvim.send_key(key)
+		} else {
+			self.terminal.send_key(key)
+		};
+
+		if let Err(error) = result {
+			let label = if editor { "nvim" } else { "terminal" };
+			self.status_message = format!("{label} input failed: {error}");
 		}
 
 		AppAction::Continue
+	}
+
+	fn handle_project_tree_key(&mut self, key: KeyEvent) -> AppAction {
+		match key.code {
+			KeyCode::Esc => AppAction::Quit,
+			KeyCode::Up => {
+				self.project_tree.move_selection(-1);
+				AppAction::Continue
+			}
+			KeyCode::Down => {
+				self.project_tree.move_selection(1);
+				AppAction::Continue
+			}
+			KeyCode::Enter => {
+				match self.project_tree.activate_selected() {
+					Some(TreeAction::ToggleDir) => {
+						self.status_message = "toggled directory".to_string();
+					}
+					Some(TreeAction::OpenFile(path)) => {
+						if let Err(error) = self.nvim.open_file(&path) {
+							self.status_message = format!("open failed: {error}");
+						} else {
+							self.focus = Focus::Editor;
+							self.status_message = format!("opened {}", path.display());
+						}
+					}
+					None => {}
+				}
+				AppAction::Continue
+			}
+			_ => AppAction::Continue,
+		}
 	}
 }
 
@@ -175,8 +256,31 @@ impl Focus {
 	}
 }
 
-impl NvimPane {
-	fn new(file_path: PathBuf) -> io::Result<Self> {
+impl PtyPane {
+	fn spawn_nvim(file_path: PathBuf) -> io::Result<Self> {
+		let mut cmd = CommandBuilder::new("nvim");
+		cmd.arg("--clean");
+		cmd.arg("-n");
+		cmd.arg(file_path.as_os_str());
+		cmd.arg("+set mouse=");
+		cmd.arg("+set list");
+		cmd.arg("+set listchars=tab:>-,space:.,trail:~");
+		cmd.arg("+syntax on");
+		cmd.cwd(env::current_dir()?);
+		cmd.env("TERM", "xterm-256color");
+		Self::spawn("nvim", cmd)
+	}
+
+	fn spawn_shell(cwd: PathBuf) -> io::Result<Self> {
+		let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+		let mut cmd = CommandBuilder::new(shell);
+		cmd.arg("-i");
+		cmd.cwd(cwd);
+		cmd.env("TERM", "xterm-256color");
+		Self::spawn("terminal", cmd)
+	}
+
+	fn spawn(title: &'static str, cmd: CommandBuilder) -> io::Result<Self> {
 		let pty_system = native_pty_system();
 		let pair = pty_system
 			.openpty(PtySize {
@@ -208,21 +312,11 @@ impl NvimPane {
 			}
 		});
 
-		let mut cmd = CommandBuilder::new("nvim");
-		cmd.arg("--clean");
-		cmd.arg(file_path.as_os_str());
-		cmd.arg("+set mouse=");
-		cmd.arg("+set list");
-		cmd.arg("+set listchars=tab:>-,space:.,trail:~");
-		cmd.arg("+syntax on");
-		cmd.cwd(std::env::current_dir()?);
-		cmd.env("TERM", "xterm-256color");
-
 		let child = pair.slave.spawn_command(cmd).map_err(io_error)?;
 		let writer = pair.master.take_writer().map_err(io_error)?;
 
 		Ok(Self {
-			file_path,
+			title,
 			parser,
 			writer,
 			master: pair.master,
@@ -245,7 +339,7 @@ impl NvimPane {
 			pixel_width: 0,
 			pixel_height: 0,
 		}) {
-			self.exit_status = Some(format!("resize failed: {error}"));
+			self.exit_status = Some(format!("{} resize failed: {error}", self.title));
 			return;
 		}
 
@@ -258,6 +352,9 @@ impl NvimPane {
 
 	fn send_key(&mut self, key: KeyEvent) -> io::Result<()> {
 		let payload = self.encode_key(key);
+		if payload.is_empty() {
+			return Ok(());
+		}
 		self.writer.write_all(&payload)?;
 		self.writer.flush()
 	}
@@ -279,10 +376,17 @@ impl NvimPane {
 		self.writer.flush()
 	}
 
-	fn snapshot(&self) -> NvimSnapshot {
+	fn open_file(&mut self, path: &Path) -> io::Result<()> {
+		let escaped = escape_nvim_path(path);
+		let command = format!("\x1b:edit {escaped}\r");
+		self.writer.write_all(command.as_bytes())?;
+		self.writer.flush()
+	}
+
+	fn snapshot(&self, ui: UiTheme) -> PtySnapshot {
 		let Ok(parser) = self.parser.lock() else {
-			return NvimSnapshot {
-				lines: vec![Line::from("nvim screen unavailable")],
+			return PtySnapshot {
+				lines: vec![Line::from("terminal unavailable")],
 				cursor: None,
 			};
 		};
@@ -309,7 +413,7 @@ impl NvimPane {
 				} else {
 					" ".to_string()
 				};
-				let style = vt_style_to_ratatui(cell, ui_theme());
+				let style = vt_style_to_ratatui(cell, ui);
 
 				match current_style {
 					Some(active) if active == style => current_text.push_str(&text),
@@ -340,7 +444,7 @@ impl NvimPane {
 			Some(screen.cursor_position())
 		};
 
-		NvimSnapshot { lines, cursor }
+		PtySnapshot { lines, cursor }
 	}
 
 	fn encode_key(&self, key: KeyEvent) -> Vec<u8> {
@@ -401,19 +505,116 @@ impl NvimPane {
 
 		match self.child.try_wait() {
 			Ok(Some(status)) => {
-				let message = format!("nvim exited: {status}");
+				let message = format!("{} exited: {status}", self.title);
 				self.exit_status = Some(message.clone());
 				Some(message)
 			}
 			Ok(None) => None,
-			Err(error) => Some(format!("nvim status failed: {error}")),
+			Err(error) => Some(format!("{} status failed: {error}", self.title)),
 		}
 	}
 }
 
-impl Drop for NvimPane {
+impl Drop for PtyPane {
 	fn drop(&mut self) {
 		let _ = self.child.kill();
+	}
+}
+
+impl ProjectTree {
+	fn new(root: PathBuf) -> Self {
+		let mut expanded = BTreeSet::new();
+		expanded.insert(root.clone());
+		let src = root.join("src");
+		if src.is_dir() {
+			expanded.insert(src);
+		}
+
+		let mut tree = Self {
+			root,
+			expanded,
+			visible: Vec::new(),
+			selected: 0,
+		};
+		tree.refresh(None);
+		tree
+	}
+
+	fn refresh(&mut self, selected_path: Option<PathBuf>) {
+		self.visible.clear();
+		let root = self.root.clone();
+		self.collect_entries(&root, 0);
+
+		if self.visible.is_empty() {
+			self.selected = 0;
+			return;
+		}
+
+		if let Some(path) = selected_path {
+			self.select_path(&path);
+		} else if self.selected >= self.visible.len() {
+			self.selected = self.visible.len() - 1;
+		}
+	}
+
+	fn collect_entries(&mut self, dir: &Path, depth: usize) {
+		let Ok(read_dir) = fs::read_dir(dir) else {
+			return;
+		};
+
+		let mut paths = read_dir.filter_map(Result::ok).collect::<Vec<_>>();
+		paths.sort_by_key(|entry| entry.path());
+
+		for entry in paths {
+			let path = entry.path();
+			let name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+			if name == ".git" || name == "target" || name.ends_with(".swp") {
+				continue;
+			}
+
+			let is_dir = path.is_dir();
+			self.visible.push(TreeEntry {
+				path: path.clone(),
+				depth,
+				is_dir,
+			});
+
+			if is_dir && self.expanded.contains(&path) {
+				self.collect_entries(&path, depth + 1);
+			}
+		}
+	}
+
+	fn move_selection(&mut self, delta: isize) {
+		if self.visible.is_empty() {
+			self.selected = 0;
+			return;
+		}
+
+		let current = self.selected as isize + delta;
+		let max = self.visible.len().saturating_sub(1) as isize;
+		self.selected = current.clamp(0, max) as usize;
+	}
+
+	fn select_path(&mut self, path: &Path) {
+		if let Some(index) = self.visible.iter().position(|entry| entry.path == path) {
+			self.selected = index;
+		}
+	}
+
+	fn activate_selected(&mut self) -> Option<TreeAction> {
+		let entry = self.visible.get(self.selected)?.clone();
+		if entry.is_dir {
+			if self.expanded.contains(&entry.path) {
+				self.expanded.remove(&entry.path);
+			} else {
+				self.expanded.insert(entry.path.clone());
+			}
+			self.refresh(Some(entry.path));
+			Some(TreeAction::ToggleDir)
+		} else {
+			Some(TreeAction::OpenFile(entry.path))
+		}
 	}
 }
 
@@ -421,17 +622,10 @@ fn render(frame: &mut Frame, app: &mut App) {
 	let area = frame.area();
 	frame.render_widget(Block::default().style(Style::default().bg(app.ui.bg)), area);
 
-	let [header, body] = Layout::default()
-		.direction(Direction::Vertical)
-		.constraints([Constraint::Length(3), Constraint::Min(20)])
-		.areas(area);
-
-	render_header(frame, header, app);
-
 	let [left, right] = Layout::default()
 		.direction(Direction::Horizontal)
 		.constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
-		.areas(body);
+		.areas(area);
 
 	let [left_top, left_bottom] = Layout::default()
 		.direction(Direction::Vertical)
@@ -448,87 +642,21 @@ fn render(frame: &mut Frame, app: &mut App) {
 		.constraints([Constraint::Percentage(82), Constraint::Percentage(18)])
 		.areas(right);
 
-	terminal_ui(frame, terminal_area, app);
+	render_pty_pane(frame, terminal_area, app.ui, app.focus == Focus::Terminal, &mut app.terminal);
 	performance_block(frame, performance_area, app);
 	project_tree(frame, left_bottom, app);
-	nvim_editor(frame, editor_area, app);
+	render_pty_pane(frame, editor_area, app.ui, app.focus == Focus::Editor, &mut app.nvim);
 	codex_block(frame, codex_area, app);
 }
 
-fn render_header(frame: &mut Frame, area: Rect, app: &App) {
-	let [brand, center, status] = Layout::default()
-		.direction(Direction::Horizontal)
-		.constraints([
-			Constraint::Length(18),
-			Constraint::Min(20),
-			Constraint::Length(34),
-		])
-		.areas(area);
-
-	let brand_text = Paragraph::new(Line::from(vec![
-		Span::styled(" C", Style::default().fg(app.ui.accent).add_modifier(Modifier::BOLD)),
-		Span::styled("¥", Style::default().fg(app.ui.accent)),
-		Span::styled("B", Style::default().fg(app.ui.accent).add_modifier(Modifier::BOLD)),
-		Span::styled("editor", Style::default().fg(app.ui.accent)),
-	]))
-	.block(panel("veditor", app.ui, false))
-	.alignment(Alignment::Left);
-
-	let center_text = Paragraph::new(Line::from(vec![
-		Span::styled(
-			format!(" {} ", app.nvim.file_path.display()),
-			Style::default().fg(app.ui.text),
-		),
-		Span::styled("EMBEDDED NVIM", Style::default().fg(app.ui.accent)),
-	]))
-	.block(panel("workspace", app.ui, false))
-	.alignment(Alignment::Center);
-
-	let status_text = Paragraph::new(Line::from(vec![
-		Span::styled(
-			" NVIM ",
-			Style::default().fg(app.ui.bg).bg(app.ui.accent),
-		),
-		Span::raw(" "),
-		Span::styled(app.focus.label(), Style::default().fg(app.ui.text)),
-		Span::raw("  "),
-		Span::styled(app.status_message.clone(), Style::default().fg(app.ui.muted)),
-	]))
-	.block(panel("status", app.ui, false))
-	.alignment(Alignment::Right);
-
-	frame.render_widget(brand_text, brand);
-	frame.render_widget(center_text, center);
-	frame.render_widget(status_text, status);
-}
-
-fn terminal_ui(frame: &mut Frame, area: Rect, app: &App) {
-	let lines = vec![
-		Line::from(vec![
-			Span::styled("$ ", Style::default().fg(app.ui.accent).add_modifier(Modifier::BOLD)),
-			Span::styled("nvim --clean", Style::default().fg(app.ui.text)),
-		]),
-		Line::styled(
-			format!("open {}", app.nvim.file_path.display()),
-			Style::default().fg(app.ui.text),
-		),
-		Line::styled("set mouse=", Style::default().fg(app.ui.text)),
-		Line::styled("set list", Style::default().fg(app.ui.text)),
-		Line::styled("set listchars=tab:>-,space:.,trail:~", Style::default().fg(app.ui.muted)),
-		Line::default(),
-		Line::styled("Ctrl-W change dashboard focus", Style::default().fg(app.ui.accent).add_modifier(Modifier::BOLD)),
-		Line::styled("Esc quits only outside nvim pane", Style::default().fg(app.ui.text)),
-	];
-
-	let terminal = Paragraph::new(lines)
-		.block(panel("terminal", app.ui, app.focus == Focus::Terminal))
-		.wrap(Wrap { trim: false });
-
-	frame.render_widget(terminal, area);
-}
-
-fn nvim_editor(frame: &mut Frame, area: Rect, app: &mut App) {
-	let block = panel("nvim", app.ui, app.focus == Focus::Editor);
+fn render_pty_pane(
+	frame: &mut Frame,
+	area: Rect,
+	ui: UiTheme,
+	focused: bool,
+	pane: &mut PtyPane,
+) {
+	let block = panel(pane.title, ui, focused);
 	let inner = block.inner(area);
 	frame.render_widget(block, area);
 
@@ -536,12 +664,12 @@ fn nvim_editor(frame: &mut Frame, area: Rect, app: &mut App) {
 		return;
 	}
 
-	app.nvim.resize(inner);
-	let snapshot = app.nvim.snapshot();
-	let editor = Paragraph::new(snapshot.lines).style(Style::default().bg(app.ui.panel));
-	frame.render_widget(editor, inner);
+	pane.resize(inner);
+	let snapshot = pane.snapshot(ui);
+	let widget = Paragraph::new(snapshot.lines).style(Style::default().bg(ui.panel));
+	frame.render_widget(widget, inner);
 
-	if app.focus == Focus::Editor {
+	if focused {
 		if let Some((row, col)) = snapshot.cursor {
 			let cursor_x = inner.x.saturating_add(col);
 			let cursor_y = inner.y.saturating_add(row);
@@ -554,15 +682,43 @@ fn nvim_editor(frame: &mut Frame, area: Rect, app: &mut App) {
 
 fn project_tree(frame: &mut Frame, area: Rect, app: &App) {
 	let items = app
-		.project_entries
+		.project_tree
+		.visible
 		.iter()
-		.map(|entry| {
-			let style = if entry.ends_with(STARTUP_FILE) || entry.ends_with("src/main.rs") {
+		.enumerate()
+		.map(|(index, entry)| {
+			let relative = entry
+				.path
+				.strip_prefix(&app.project_tree.root)
+				.unwrap_or(&entry.path)
+				.display()
+				.to_string();
+			let indent = "  ".repeat(entry.depth);
+			let symbol = if entry.is_dir {
+				if app.project_tree.expanded.contains(&entry.path) {
+					"▾"
+				} else {
+					"▸"
+				}
+			} else {
+				"•"
+			};
+
+			let style = if index == app.project_tree.selected {
+				Style::default()
+					.fg(app.ui.bg)
+					.bg(app.ui.accent)
+					.add_modifier(Modifier::BOLD)
+			} else if entry.path == app.project_tree.root.join(STARTUP_FILE) {
 				Style::default().fg(app.ui.accent).add_modifier(Modifier::BOLD)
 			} else {
 				Style::default().fg(app.ui.text)
 			};
-			ListItem::new(Line::from(Span::styled(entry.clone(), style)))
+
+			ListItem::new(Line::from(Span::styled(
+				format!("{indent}{symbol} {relative}"),
+				style,
+			)))
 		})
 		.collect::<Vec<_>>();
 
@@ -618,13 +774,13 @@ fn performance_block(frame: &mut Frame, area: Rect, app: &App) {
 fn codex_block(frame: &mut Frame, area: Rect, app: &App) {
 	let content = vec![
 		Line::from(vec![
-			Span::styled("mode", Style::default().fg(app.ui.accent).add_modifier(Modifier::BOLD)),
+			Span::styled("status", Style::default().fg(app.ui.accent).add_modifier(Modifier::BOLD)),
 			Span::raw(": "),
-			Span::styled("embedded nvim", Style::default().fg(app.ui.text)),
+			Span::styled(app.status_message.clone(), Style::default().fg(app.ui.text)),
 		]),
-		Line::styled("real vim keybindings live in the editor pane", Style::default().fg(app.ui.text)),
-		Line::styled("tabs and spaces are shown by nvim listchars", Style::default().fg(app.ui.muted)),
-		Line::styled("app only owns layout + focus switching", Style::default().fg(app.ui.muted)),
+		Line::styled("Ctrl-W cycles pane focus", Style::default().fg(app.ui.text)),
+		Line::styled("project tree: Up/Down select, Enter expand/open", Style::default().fg(app.ui.muted)),
+		Line::styled("editor + terminal are real PTYs", Style::default().fg(app.ui.muted)),
 	];
 
 	let codex = Paragraph::new(content)
@@ -652,53 +808,6 @@ fn panel<'a>(title: &'a str, ui: UiTheme, focused: bool) -> Block<'a> {
 			)])
 			.left_aligned(),
 		)
-}
-
-fn collect_project_entries(root: &Path) -> Vec<String> {
-	let mut entries = Vec::new();
-	collect_entries_recursive(root, root, &mut entries, 0);
-	if entries.is_empty() {
-		entries.push("src/main.rs".to_string());
-	}
-	entries
-}
-
-fn collect_entries_recursive(root: &Path, current: &Path, entries: &mut Vec<String>, depth: usize) {
-	if depth > 2 {
-		return;
-	}
-
-	let Ok(read_dir) = fs::read_dir(current) else {
-		return;
-	};
-
-	let mut paths = read_dir.filter_map(Result::ok).collect::<Vec<_>>();
-	paths.sort_by_key(|entry| entry.path());
-
-	for entry in paths {
-		let path = entry.path();
-		let name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
-		if name == ".git" || name == "target" || name.ends_with(".swp") {
-			continue;
-		}
-
-		let relative = path
-			.strip_prefix(root)
-			.unwrap_or(&path)
-			.display()
-			.to_string();
-		let indent = "  ".repeat(depth);
-		let label = if path.is_dir() {
-			format!("{indent}▾ {relative}")
-		} else {
-			format!("{indent}• {relative}")
-		};
-		entries.push(label);
-
-		if path.is_dir() {
-			collect_entries_recursive(root, &path, entries, depth + 1);
-		}
-	}
 }
 
 fn vt_style_to_ratatui(cell: &vt100::Cell, ui: UiTheme) -> Style {
@@ -770,6 +879,13 @@ fn cube_value(index: u8) -> u8 {
 		0 => 0,
 		_ => 55 + index * 40,
 	}
+}
+
+fn escape_nvim_path(path: &Path) -> String {
+	path.display()
+		.to_string()
+		.replace('\\', "\\\\")
+		.replace(' ', "\\ ")
 }
 
 fn encode_ctrl_char(ch: char) -> Option<u8> {
