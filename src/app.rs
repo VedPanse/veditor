@@ -105,6 +105,7 @@ impl App {
             active_file: None,
             nvim: PtyPane::spawn_nvim(initial_editor_target.clone(), root.clone(), ui)?,
             terminal: PtyPane::spawn_shell(root)?,
+            keyboard_audio: KeyboardAudio::new(),
             codex_history_area: None,
             codex_change_list_area: None,
         }
@@ -132,6 +133,8 @@ impl App {
 
     /// Dispatches a terminal event into the active focus target.
     pub(crate) fn handle_event(&mut self, event: Event) -> AppAction {
+        play_keyboard_sound_for_event(&mut self.keyboard_audio, &event);
+
         match event {
             Event::Key(key) if is_key_press(key.kind) => self.handle_key(key),
             Event::Paste(text) => {

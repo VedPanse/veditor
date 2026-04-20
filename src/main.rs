@@ -28,6 +28,7 @@ use ratatui::{
 use vt100::{Color as VtColor, Parser};
 
 mod app;
+mod audio;
 mod codex;
 mod persistence;
 mod preview;
@@ -36,6 +37,7 @@ mod pty;
 mod render;
 mod theme;
 
+use audio::{KeyboardAudio, play_keyboard_sound_for_event};
 use persistence::{
     load_global_settings, load_saved_session, nvim_snapshot_path, parse_nvim_buffer_state,
     save_global_settings, save_saved_session, session_state_path,
@@ -145,6 +147,7 @@ struct App {
     active_file: Option<PathBuf>,
     nvim: PtyPane,
     terminal: PtyPane,
+    keyboard_audio: KeyboardAudio,
     terminal_metrics: TerminalMetrics,
     codex_history_area: Option<Rect>,
     codex_change_list_area: Option<Rect>,
@@ -1184,8 +1187,27 @@ fn io_error(error: impl std::fmt::Display) -> io::Error {
 mod tests {
     use crate::{
         ThemeMood,
+        audio::{
+            KeyboardSound, KeyboardSoundPlayer, keyboard_sound_for_event, keyboard_sound_for_key,
+            play_keyboard_sound_for_event,
+        },
         theme::{normalize_hex_color, normalize_theme_mood, ui_theme},
     };
+    use crossterm::event::{
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, ModifierKeyCode, MouseButton,
+        MouseEvent, MouseEventKind,
+    };
+
+    #[derive(Default)]
+    struct MockKeyboardAudio {
+        played: Vec<KeyboardSound>,
+    }
+
+    impl KeyboardSoundPlayer for MockKeyboardAudio {
+        fn play(&mut self, sound: KeyboardSound) {
+            self.played.push(sound);
+        }
+    }
 
     #[test]
     fn normalize_hex_color_keeps_single_hash() {
@@ -1213,5 +1235,135 @@ mod tests {
         assert_ne!(ui.glow_hot, ui.accent);
         assert_ne!(ui.glow_fill, ui.panel);
         assert_eq!(ui.mood, ThemeMood::Synthwave84);
+    }
+
+    #[test]
+    fn keyboard_sound_classifies_special_and_default_keys() {
+        assert_eq!(
+            keyboard_sound_for_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            Some(KeyboardSound::Escape)
+        );
+        assert_eq!(
+            keyboard_sound_for_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(KeyboardSound::Enter)
+        );
+        assert_eq!(
+            keyboard_sound_for_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
+            Some(KeyboardSound::Space)
+        );
+        assert_eq!(
+            keyboard_sound_for_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+            Some(KeyboardSound::Default)
+        );
+        assert_eq!(
+            keyboard_sound_for_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            Some(KeyboardSound::Default)
+        );
+        assert_eq!(
+            keyboard_sound_for_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+            Some(KeyboardSound::Default)
+        );
+        assert_eq!(
+            keyboard_sound_for_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            Some(KeyboardSound::Default)
+        );
+        assert_eq!(
+            keyboard_sound_for_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL,)),
+            Some(KeyboardSound::Default)
+        );
+    }
+
+    #[test]
+    fn keyboard_sound_ignores_modifier_only_keys() {
+        assert_eq!(
+            keyboard_sound_for_key(KeyEvent::new(
+                KeyCode::Modifier(ModifierKeyCode::LeftShift),
+                KeyModifiers::SHIFT,
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn keyboard_sound_routes_only_key_press_and_repeat_events() {
+        assert_eq!(
+            keyboard_sound_for_event(&Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Char('a'),
+                KeyModifiers::NONE,
+                KeyEventKind::Press,
+            ))),
+            Some(KeyboardSound::Default)
+        );
+        assert_eq!(
+            keyboard_sound_for_event(&Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Char('a'),
+                KeyModifiers::NONE,
+                KeyEventKind::Repeat,
+            ))),
+            Some(KeyboardSound::Default)
+        );
+        assert_eq!(
+            keyboard_sound_for_event(&Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Char('a'),
+                KeyModifiers::NONE,
+                KeyEventKind::Release,
+            ))),
+            None
+        );
+        assert_eq!(
+            keyboard_sound_for_event(&Event::Paste("abc".to_string())),
+            None
+        );
+        assert_eq!(
+            keyboard_sound_for_event(&Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 1,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            })),
+            None
+        );
+        assert_eq!(keyboard_sound_for_event(&Event::Resize(120, 40)), None);
+        assert_eq!(keyboard_sound_for_event(&Event::FocusGained), None);
+        assert_eq!(keyboard_sound_for_event(&Event::FocusLost), None);
+    }
+
+    #[test]
+    fn keyboard_sound_player_is_only_called_for_soundable_key_events() {
+        let mut audio = MockKeyboardAudio::default();
+        play_keyboard_sound_for_event(
+            &mut audio,
+            &Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        );
+        play_keyboard_sound_for_event(
+            &mut audio,
+            &Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Char('r'),
+                KeyModifiers::NONE,
+                KeyEventKind::Repeat,
+            )),
+        );
+        play_keyboard_sound_for_event(
+            &mut audio,
+            &Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Char('r'),
+                KeyModifiers::NONE,
+                KeyEventKind::Release,
+            )),
+        );
+        play_keyboard_sound_for_event(
+            &mut audio,
+            &Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }),
+        );
+
+        assert_eq!(
+            audio.played,
+            vec![KeyboardSound::Escape, KeyboardSound::Default]
+        );
     }
 }
