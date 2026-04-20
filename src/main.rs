@@ -132,6 +132,7 @@ struct App {
     mood: ThemeMood,
     ui: UiTheme,
     accent_registry: BTreeMap<String, String>,
+    sound_enabled: bool,
     command_output: Option<CommandOutput>,
     project_tree: ProjectTree,
     codex_chat: CodexChat,
@@ -343,12 +344,14 @@ struct SessionState {
     accent_hex: Option<String>,
     mood: Option<String>,
     accent_registry: BTreeMap<String, String>,
+    sound_enabled: bool,
 }
 
 struct GlobalSettings {
     accent_hex: Option<String>,
     mood: Option<String>,
     accent_registry: BTreeMap<String, String>,
+    sound_enabled: bool,
 }
 
 struct NvimBufferState {
@@ -1161,6 +1164,14 @@ fn is_key_press(kind: KeyEventKind) -> bool {
     matches!(kind, KeyEventKind::Press | KeyEventKind::Repeat)
 }
 
+fn normalize_sound_setting(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "on" | "true" | "enabled" => Some(true),
+        "off" | "false" | "disabled" => Some(false),
+        _ => None,
+    }
+}
+
 fn codex_last_message_path() -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1191,6 +1202,7 @@ mod tests {
             KeyboardSound, KeyboardSoundPlayer, keyboard_sound_for_event, keyboard_sound_for_key,
             play_keyboard_sound_for_event,
         },
+        normalize_sound_setting,
         theme::{normalize_hex_color, normalize_theme_mood, ui_theme},
     };
     use crossterm::event::{
@@ -1365,5 +1377,14 @@ mod tests {
             audio.played,
             vec![KeyboardSound::Escape, KeyboardSound::Default]
         );
+    }
+
+    #[test]
+    fn normalize_sound_setting_accepts_on_and_off_aliases() {
+        assert_eq!(normalize_sound_setting("on"), Some(true));
+        assert_eq!(normalize_sound_setting("enabled"), Some(true));
+        assert_eq!(normalize_sound_setting("off"), Some(false));
+        assert_eq!(normalize_sound_setting("disabled"), Some(false));
+        assert_eq!(normalize_sound_setting("loud"), None);
     }
 }

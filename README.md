@@ -75,6 +75,9 @@
 - `:set mood synthwave84`
 - `:set mood default`
 - `:get mood`
+- `:set sound on`
+- `:set sound off`
+- `:get sound`
 
 ## Requirements
 
