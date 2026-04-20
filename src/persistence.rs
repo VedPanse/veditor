@@ -57,6 +57,10 @@ pub(crate) fn load_saved_session() -> Option<SessionState> {
                 .collect::<BTreeMap<_, _>>()
         })
         .unwrap_or_default();
+    let sound_enabled = value
+        .get("sound_enabled")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
 
     Some(SessionState {
         root,
@@ -65,6 +69,7 @@ pub(crate) fn load_saved_session() -> Option<SessionState> {
         accent_hex,
         mood,
         accent_registry,
+        sound_enabled,
     })
 }
 
@@ -84,6 +89,7 @@ pub(crate) fn save_saved_session(session: &SessionState) -> io::Result<()> {
         "accent_hex": session.accent_hex,
         "mood": session.mood,
         "accent_registry": session.accent_registry,
+        "sound_enabled": session.sound_enabled,
     });
     let contents = serde_json::to_string_pretty(&payload).map_err(io_error)?;
     fs::write(path, contents)
@@ -118,11 +124,16 @@ pub(crate) fn load_global_settings() -> Option<GlobalSettings> {
                 .collect::<BTreeMap<_, _>>()
         })
         .unwrap_or_default();
+    let sound_enabled = value
+        .get("sound_enabled")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
 
     Some(GlobalSettings {
         accent_hex,
         mood,
         accent_registry,
+        sound_enabled,
     })
 }
 
@@ -153,6 +164,7 @@ pub(crate) fn save_global_settings(settings: &GlobalSettings) -> io::Result<()> 
         "accent_hex": settings.accent_hex,
         "mood": settings.mood,
         "accent_registry": accent_registry,
+        "sound_enabled": settings.sound_enabled,
     });
     let contents = serde_json::to_string_pretty(&payload).map_err(io_error)?;
     fs::write(path, contents)

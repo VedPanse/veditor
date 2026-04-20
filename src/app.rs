@@ -29,6 +29,11 @@ impl App {
                     .and_then(normalize_theme_mood)
             })
             .unwrap_or(ThemeMood::Default);
+        let sound_enabled = global_settings
+            .as_ref()
+            .map(|settings| settings.sound_enabled)
+            .or_else(|| saved_session.as_ref().map(|session| session.sound_enabled))
+            .unwrap_or(true);
         let saved_accent_registry = global_settings
             .as_ref()
             .map(|settings| settings.accent_registry.clone())
@@ -90,6 +95,7 @@ impl App {
             mood: saved_mood,
             ui,
             accent_registry,
+            sound_enabled,
             command_output: None,
             project_tree,
             codex_chat: CodexChat::new(&root, &startup_target),
@@ -105,6 +111,7 @@ impl App {
             active_file: None,
             nvim: PtyPane::spawn_nvim(initial_editor_target.clone(), root.clone(), ui)?,
             terminal: PtyPane::spawn_shell(root)?,
+            keyboard_audio: KeyboardAudio::new(),
             codex_history_area: None,
             codex_change_list_area: None,
         }
@@ -132,6 +139,10 @@ impl App {
 
     /// Dispatches a terminal event into the active focus target.
     pub(crate) fn handle_event(&mut self, event: Event) -> AppAction {
+        if self.sound_enabled {
+            play_keyboard_sound_for_event(&mut self.keyboard_audio, &event);
+        }
+
         match event {
             Event::Key(key) if is_key_press(key.kind) => self.handle_key(key),
             Event::Paste(text) => {
@@ -785,6 +796,22 @@ impl App {
                 self.status_message = "mood set to synthwave84".to_string();
                 Ok(())
             }
+            [":set", "sound", value] => {
+                let enabled = normalize_sound_setting(value)
+                    .ok_or_else(|| io_error("usage: :set sound on | :set sound off"))?;
+                self.apply_sound_command(enabled)?;
+                self.command_prompt = None;
+                self.command_output = Some(self.build_sound_output());
+                self.status_message = format!(
+                    "sound {}",
+                    if self.sound_enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                );
+                Ok(())
+            }
             [":set", "mood", value] => {
                 let mood = normalize_theme_mood(value).ok_or_else(|| {
                     io_error("usage: :set mood | :set mood synthwave84 | :set mood default")
@@ -833,6 +860,19 @@ impl App {
                 self.status_message = format!("current mood {}", theme_mood_name(self.mood));
                 Ok(())
             }
+            [":get", "sound"] => {
+                self.command_output = Some(self.build_sound_output());
+                self.command_prompt = None;
+                self.status_message = format!(
+                    "sound {}",
+                    if self.sound_enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                );
+                Ok(())
+            }
             _ => Err(io_error("unknown command")),
         }
     }
@@ -853,6 +893,12 @@ impl App {
         if !self.nvim.is_exited() {
             self.nvim.apply_theme(self.ui)?;
         }
+        let _ = self.persist_session_state(false);
+        Ok(())
+    }
+
+    fn apply_sound_command(&mut self, enabled: bool) -> io::Result<()> {
+        self.sound_enabled = enabled;
         let _ = self.persist_session_state(false);
         Ok(())
     }
@@ -934,6 +980,37 @@ impl App {
                     ),
                     Span::raw("  "),
                     Span::styled(badge, Style::default().fg(self.ui.special)),
+                ]),
+                Line::styled(description, Style::default().fg(self.ui.muted)),
+            ],
+        }
+    }
+
+    fn build_sound_output(&self) -> CommandOutput {
+        let state = if self.sound_enabled { "on" } else { "off" };
+        let description = if self.sound_enabled {
+            "keyboard sounds play for app-wide key presses"
+        } else {
+            "keyboard sounds are muted across the app"
+        };
+
+        CommandOutput {
+            title: "sound".to_string(),
+            lines: vec![
+                Line::from(vec![
+                    Span::styled(
+                        "sound ",
+                        Style::default()
+                            .fg(self.ui.accent)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        state,
+                        Style::default()
+                            .fg(self.ui.bg)
+                            .bg(self.ui.accent)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                 ]),
                 Line::styled(description, Style::default().fg(self.ui.muted)),
             ],
@@ -1339,11 +1416,13 @@ impl App {
             accent_hex: Some(self.accent_hex.clone()),
             mood: Some(theme_mood_name(self.mood).to_string()),
             accent_registry: self.accent_registry.clone(),
+            sound_enabled: self.sound_enabled,
         })?;
         save_global_settings(&GlobalSettings {
             accent_hex: Some(self.accent_hex.clone()),
             mood: Some(theme_mood_name(self.mood).to_string()),
             accent_registry: self.accent_registry.clone(),
+            sound_enabled: self.sound_enabled,
         })
     }
 

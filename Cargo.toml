@@ -13,6 +13,7 @@ image = "0.25.8"
 portable-pty = "0.9.0"
 pdf-extract = "0.7"
 ratatui = "0.30.0"
+rodio = { version = "0.22.2", default-features = false, features = ["playback"] }
 serde_json = "1.0.145"
 vt100 = "0.16.2"
 
